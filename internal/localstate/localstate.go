@@ -8,6 +8,7 @@
 package localstate
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,38 @@ type State struct {
 	Version       uint64   `json:"version"`        // last accepted manifest version (0 = none)
 	ManifestHash  string   `json:"manifest_hash"`  // last accepted manifest hash (hex)
 	ImportedPacks []string `json:"imported_packs"` // pack ids already in the local object store
+
+	// Tier 3 roster pin (§1.4 anti-rollback) plus the locally-trusted roster.
+	// RosterPinned distinguishes "genesis roster v0 accepted" (version 0) from
+	// "no roster seen yet", since the genesis version is 0.
+	RosterPinned  bool   `json:"roster_pinned"`
+	RosterVersion uint64 `json:"roster_version"`
+	RosterHash    string `json:"roster_hash"`
+	TrustedRoster []byte `json:"trusted_roster"` // canonical plaintext of the last accepted roster
+
+	// RepoKeys is the member-local cache of every repo key this client has held.
+	// The keyfile only ever wraps the CURRENT key; after a minimal-rotation removal
+	// (§3.2) older packs remain under older keys, so a continuing member must retain
+	// the old keys to read pre-rotation packs or to run a full rekey. Fresh clones
+	// only ever learn the current key (the documented minimal-rotation limitation).
+	RepoKeys [][]byte `json:"repo_keys"`
+}
+
+// HasKey reports whether k is already in the local key cache.
+func (st *State) HasKey(k []byte) bool {
+	for _, e := range st.RepoKeys {
+		if bytes.Equal(e, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// AddKey records a repo key in the local cache (idempotent).
+func (st *State) AddKey(k []byte) {
+	if !st.HasKey(k) {
+		st.RepoKeys = append(st.RepoKeys, append([]byte(nil), k...))
+	}
 }
 
 // Store loads and saves State at a file path.
