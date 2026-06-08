@@ -219,3 +219,61 @@ Decisions taken within the freedom of the frozen Tier-3 contract.
 - The carried-over §7 v1 items (age-recipient equivalence, sign-then-encrypt) and the **Fork-3
   soundness** question (roster-downgrade / cross-roster splice) are external-review items, implemented
   as written and marked `// SECURITY-REVIEW`. They are NOT decided here.
+
+---
+
+## v2 — cross-roster splice fix (red-team outcome) — see `docs/FORMAT-SPEC-TIER3.md`
+
+A red-team review of the Tier-3 design produced three findings; this records the resolution and the
+exact, irreducible residual risk. **No backward compatibility** is kept — pre-v2 repositories are
+re-initialized; there are no compat shims for pre-v2 blobs.
+
+### Q1 — age recipient derived from repo_key: SOUND (design intent)
+Deriving an X25519 recipient from the repo key (`scalar = HKDF(repo_key, "encgit/pack-recipient/v1" ||
+repo_id)`) is deliberate and safe in our model. The recipient is an ordinary X25519 recipient; the
+security of pack/manifest/roster confidentiality and integrity rests on **age's AEAD** (ChaCha20-
+Poly1305 STREAM) plus, for authenticity of state, the **Ed25519** signatures over the canonical bytes.
+We never hand-roll AEAD or nonces. The operational order is **AEAD-decrypt → then verify**, and an
+**AEAD failure is fatal** (returned as an error, never ignored): a forged/tampered blob fails to
+decrypt before any signature logic runs.
+
+### Q2 — sign-then-encrypt: SOUND (design intent)
+Signing the canonical sig-less JCS bytes and then age-encrypting is correct for our model: the signed
+bytes cover every semantic field (repo_id, version, prev hashes, refs, packs, pusher/author,
+roster_hash, repo_key_generation), and confidentiality is added by the outer age layer. The signature
+is what authenticates state across the untrusted server; the AEAD authenticates the ciphertext blob.
+
+### Q3 — cross-roster splice: CLOSED by m1 + m2
+The attack mixed the three independent server pointers (roster, keyfile, manifest) to reanimate a
+removed member against a lagging client. Closed by binding them:
+- **m1** (`// SECURITY-REVIEW`): the manifest carries a signed `roster_hash`; on accept it MUST equal
+  the hash of the client's current trusted roster (after advancing the roster pin), so a manifest made
+  under a different roster — even one signed by a then-valid, since-removed member — is rejected.
+- **m2** (`// SECURITY-REVIEW`): the keyfile carries its `repo_key_generation` inside the age-AEAD
+  payload (`uint64-BE(gen) || repo_key_32`); on accept it MUST equal the current roster's
+  `repo_key_generation`, so a downgraded keyfile is rejected. Consequence E: every roster change
+  re-issues the current manifest with the new `roster_hash` (and, for remove/rekey, under the new key).
+
+### Residual risk (stated plainly)
+m1 + m2 reduce the splice to **pure §5.7-style equivocation against a fully-frozen lagging member**: a
+victim that the server keeps entirely at generation G — old roster (gen G) + old keyfile (gen G) + old
+key — sees an internally consistent world and cannot, from cryptography alone, tell it is stale. This
+is **unpreventable** against an adversary that owns storage (it can simply never reveal the newer
+head); it is only **detectable** — on synchronization (the §5.7 / roster pin trips the moment the
+victim ever sees generation G+1) and via out-of-band comparison of the roster fingerprint/hash. **m3**
+(always read the server's roster head and refuse to operate on anything older a valid chain proves) is
+**hygiene, not a cryptographic barrier**: it shrinks the window but a server that withholds the head
+defeats it.
+
+### v2 implementation decisions
+- **Keyfile generation** lives only inside the AEAD payload; the store never sees it (fixed 40-byte
+  binary layout, not a custom AEAD). `UnwrapRepoKey` returns `(generation, repo_key)` and rejects any
+  payload that is not exactly 40 bytes.
+- **`repo_key_generation` semantics**: genesis 0; +1 on remove (minimal rotation) and full rekey;
+  unchanged on add and on ordinary pushes. The roster `version` (membership-change counter) is
+  independent of it.
+- **Roster decryption uses the multi-key cache** (not just the keyfile's key), so a downgraded keyfile
+  cannot hide the real current-generation roster from a continuing member — the mismatch then surfaces
+  cleanly at the m2 check rather than as an opaque "cannot decrypt" error.
+- Manifest acceptance order is exactly rule D: advance roster pin → m2 (keyfile gen) → decrypt manifest
+  → m1 (roster_hash) + signer ∈ roster → §5.7 chain.
