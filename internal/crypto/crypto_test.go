@@ -3,10 +3,30 @@ package crypto
 import (
 	"bytes"
 	"crypto/rand"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"encgit/internal/agekey"
 )
+
+// TestInfoStringMatchesSpec checks that the pack/manifest-recipient HKDF label in
+// the code is byte-for-byte identical to the string written in the frozen spec
+// (§7.3). The repo_id appended after this label is the raw bytes (see FORMAT-NOTES);
+// only the literal label is compared here.
+func TestInfoStringMatchesSpec(t *testing.T) {
+	if infoPackRecipient != "encgit/pack-recipient/v1" {
+		t.Errorf("infoPackRecipient = %q", infoPackRecipient)
+	}
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "FORMAT-SPEC.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), infoPackRecipient) {
+		t.Errorf("info string %q not found in docs/FORMAT-SPEC.md", infoPackRecipient)
+	}
+}
 
 func TestPackRoundTripAndTamper(t *testing.T) {
 	repoKey := bytes.Repeat([]byte{0x07}, 32)
