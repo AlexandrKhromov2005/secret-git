@@ -59,6 +59,9 @@ func (e *Engine) AddMember(name string, xpub, edpub [32]byte, oobFingerprint str
 	if err != nil {
 		return err
 	}
+	if err := e.checkKeyfileGeneration(trusted); err != nil {
+		return err
+	}
 	if !e.selfIsMember(trusted) {
 		return errors.New("helper: only a current member can change the roster")
 	}
@@ -86,11 +89,12 @@ func (e *Engine) AddMember(name string, xpub, edpub [32]byte, oobFingerprint str
 
 	newMembers := append(copyMembers(trusted.Members), newMember)
 	newR := &roster.Roster{
-		RepoID:         e.repoHex,
-		Version:        trusted.Version + 1,
-		PrevRosterHash: &curHash,
-		Members:        newMembers,
-		AuthorKeyID:    e.member.FingerprintHex(),
+		RepoID:            e.repoHex,
+		Version:           trusted.Version + 1,
+		PrevRosterHash:    &curHash,
+		Members:           newMembers,
+		AuthorKeyID:       e.member.FingerprintHex(),
+		RepoKeyGeneration: trusted.RepoKeyGeneration, // add does NOT rotate the repo key (§B)
 	}
 	if err := newR.Sign(e.member.SigningKey()); err != nil {
 		return err
@@ -99,6 +103,7 @@ func (e *Engine) AddMember(name string, xpub, edpub [32]byte, oobFingerprint str
 	if err != nil {
 		return err
 	}
+	newRosterHash := util.SHA256Hex(plain)
 	blob, err := crypto.Encrypt(plain, e.pack.Recipient) // same key — no rotation on add
 	if err != nil {
 		return err
@@ -107,12 +112,13 @@ func (e *Engine) AddMember(name string, xpub, edpub [32]byte, oobFingerprint str
 		return fmt.Errorf("helper: publish roster: %w", err)
 	}
 
-	// Rebuild the keyfile so the new member can unwrap the (unchanged) repo key.
+	// Rebuild the keyfile so the new member can unwrap the (unchanged) repo key; the
+	// generation is unchanged.
 	recips, err := rosterRecipients(newMembers)
 	if err != nil {
 		return err
 	}
-	keyfile, err := crypto.WrapRepoKey(e.repoKey, recips...)
+	keyfile, err := crypto.WrapRepoKey(trusted.RepoKeyGeneration, e.repoKey, recips...)
 	if err != nil {
 		return err
 	}
@@ -124,7 +130,11 @@ func (e *Engine) AddMember(name string, xpub, edpub [32]byte, oobFingerprint str
 	if err != nil {
 		return err
 	}
-	return e.pinRoster(&st, newR, plain, util.SHA256Hex(plain))
+	// m1 (§E): re-publish the current manifest with the NEW roster_hash, same key.
+	if err := e.republishManifest(trusted, curHash, newRosterHash, e.pack, &st); err != nil {
+		return err
+	}
+	return e.pinRoster(&st, newR, plain, newRosterHash)
 }
 
 // RemoveMember removes C and performs the default minimal rotation (§3.2): a new
@@ -140,6 +150,9 @@ func (e *Engine) RemoveMember(targetFingerprint string) error {
 	}
 	trusted, curHash, err := e.loadTrustedRoster()
 	if err != nil {
+		return err
+	}
+	if err := e.checkKeyfileGeneration(trusted); err != nil {
 		return err
 	}
 	if !e.selfIsMember(trusted) {
@@ -166,13 +179,16 @@ func (e *Engine) RemoveMember(targetFingerprint string) error {
 		return err
 	}
 
+	newGen := trusted.RepoKeyGeneration + 1 // remove rotates the repo key (§B)
+
 	// New roster without C, encrypted to the NEW pack key (C cannot read it).
 	newR := &roster.Roster{
-		RepoID:         e.repoHex,
-		Version:        trusted.Version + 1,
-		PrevRosterHash: &curHash,
-		Members:        remaining,
-		AuthorKeyID:    e.member.FingerprintHex(),
+		RepoID:            e.repoHex,
+		Version:           trusted.Version + 1,
+		PrevRosterHash:    &curHash,
+		Members:           remaining,
+		AuthorKeyID:       e.member.FingerprintHex(),
+		RepoKeyGeneration: newGen,
 	}
 	if err := newR.Sign(e.member.SigningKey()); err != nil {
 		return err
@@ -181,6 +197,7 @@ func (e *Engine) RemoveMember(targetFingerprint string) error {
 	if err != nil {
 		return err
 	}
+	newRosterHash := util.SHA256Hex(rplain)
 	rblob, err := crypto.Encrypt(rplain, newPack.Recipient)
 	if err != nil {
 		return err
@@ -189,12 +206,12 @@ func (e *Engine) RemoveMember(targetFingerprint string) error {
 		return fmt.Errorf("helper: publish roster: %w", err)
 	}
 
-	// New keyfile: wrap the NEW repo key only to the remaining members.
+	// New keyfile: wrap the NEW repo key (new generation) only to the remaining members.
 	recips, err := rosterRecipients(remaining)
 	if err != nil {
 		return err
 	}
-	keyfile, err := crypto.WrapRepoKey(newRepoKey, recips...)
+	keyfile, err := crypto.WrapRepoKey(newGen, newRepoKey, recips...)
 	if err != nil {
 		return err
 	}
@@ -207,9 +224,9 @@ func (e *Engine) RemoveMember(targetFingerprint string) error {
 		return err
 	}
 
-	// Re-publish the current manifest (same refs/packs) under the new key so members
-	// who now hold only the new key can still read it.
-	if err := e.republishManifest(trusted, newPack, &st); err != nil {
+	// Re-publish the current manifest (same refs/packs) under the new key and new
+	// roster_hash so members who now hold only the new key can still read it (§E, m1).
+	if err := e.republishManifest(trusted, curHash, newRosterHash, newPack, &st); err != nil {
 		return err
 	}
 
@@ -219,11 +236,13 @@ func (e *Engine) RemoveMember(targetFingerprint string) error {
 	return e.pinRoster(&st, newR, rplain, util.SHA256Hex(rplain))
 }
 
-// republishManifest re-encrypts the current manifest (unchanged refs/packs) under
-// newPack at the next version, updating the manifest pin in st. No-op if there is no
-// manifest yet.
-func (e *Engine) republishManifest(trusted *roster.Roster, newPack *crypto.PackKeys, st *localstate.State) error {
-	cur, err := e.loadCurrent(trusted) // decrypts with the current (old) key
+// republishManifest re-issues the current manifest (unchanged refs/packs) at the
+// next version, stamped with newRosterHash and encrypted under newPack (which may be
+// the same key for add, or a rotated key for remove). It reads the current manifest
+// verifying it against the OLD roster (oldTrusted/oldTrustedHash). No-op if there is
+// no manifest yet (§E: the first push will carry the current roster_hash).
+func (e *Engine) republishManifest(oldTrusted *roster.Roster, oldTrustedHash, newRosterHash string, newPack *crypto.PackKeys, st *localstate.State) error {
+	cur, err := e.loadCurrent(oldTrusted, oldTrustedHash) // decrypts/verifies against the old roster
 	if err != nil {
 		return err
 	}
@@ -237,6 +256,7 @@ func (e *Engine) republishManifest(trusted *roster.Roster, newPack *crypto.PackK
 		Refs:             cur.manifest.Refs,
 		Packs:            cur.manifest.Packs,
 		PusherKeyID:      e.member.FingerprintHex(),
+		RosterHash:       newRosterHash, // m1: bind the re-issued manifest to the new roster
 	}
 	if err := m.Sign(e.member.SigningKey()); err != nil {
 		return err
@@ -269,10 +289,13 @@ func (e *Engine) FullRekey() error {
 	if err != nil {
 		return err
 	}
+	if err := e.checkKeyfileGeneration(trusted); err != nil {
+		return err
+	}
 	if !e.selfIsMember(trusted) {
 		return errors.New("helper: only a current member can rekey")
 	}
-	cur, err := e.loadCurrent(trusted)
+	cur, err := e.loadCurrent(trusted, curRosterHash)
 	if err != nil {
 		return err
 	}
@@ -285,6 +308,25 @@ func (e *Engine) FullRekey() error {
 	if err != nil {
 		return err
 	}
+	newGen := trusted.RepoKeyGeneration + 1 // full rekey rotates the repo key (§B)
+
+	// Build the new roster first so the re-issued manifest can carry its hash (m1).
+	newR := &roster.Roster{
+		RepoID:            e.repoHex,
+		Version:           trusted.Version + 1,
+		PrevRosterHash:    &curRosterHash,
+		Members:           trusted.Members,
+		AuthorKeyID:       e.member.FingerprintHex(),
+		RepoKeyGeneration: newGen,
+	}
+	if err := newR.Sign(e.member.SigningKey()); err != nil {
+		return err
+	}
+	rplain, err := newR.Marshal()
+	if err != nil {
+		return err
+	}
+	newRosterHash := util.SHA256Hex(rplain)
 
 	st, _, err := e.state.Load()
 	if err != nil {
@@ -326,6 +368,7 @@ func (e *Engine) FullRekey() error {
 			Refs:             cur.manifest.Refs,
 			Packs:            newPacks,
 			PusherKeyID:      e.member.FingerprintHex(),
+			RosterHash:       newRosterHash, // m1: bind to the new roster
 		}
 		if err := m.Sign(e.member.SigningKey()); err != nil {
 			return err
@@ -345,12 +388,12 @@ func (e *Engine) FullRekey() error {
 		st.ManifestHash = util.SHA256Hex(mplain)
 	}
 
-	// Rewrap the keyfile under the new key to the current members.
+	// Rewrap the keyfile under the new key + new generation to the current members.
 	recips, err := rosterRecipients(trusted.Members)
 	if err != nil {
 		return err
 	}
-	keyfile, err := crypto.WrapRepoKey(newRepoKey, recips...)
+	keyfile, err := crypto.WrapRepoKey(newGen, newRepoKey, recips...)
 	if err != nil {
 		return err
 	}
@@ -358,21 +401,8 @@ func (e *Engine) FullRekey() error {
 		return err
 	}
 
-	// Re-publish the roster (same members) under the new key.
-	newR := &roster.Roster{
-		RepoID:         e.repoHex,
-		Version:        trusted.Version + 1,
-		PrevRosterHash: &curRosterHash,
-		Members:        trusted.Members,
-		AuthorKeyID:    e.member.FingerprintHex(),
-	}
-	if err := newR.Sign(e.member.SigningKey()); err != nil {
-		return err
-	}
-	rplain, err := newR.Marshal()
-	if err != nil {
-		return err
-	}
+	// Re-publish the roster (same members, new generation) under the new key. The
+	// roster object was built above so the manifest could carry its hash.
 	rblob, err := crypto.Encrypt(rplain, newPack.Recipient)
 	if err != nil {
 		return err

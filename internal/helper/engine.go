@@ -42,7 +42,7 @@ func Init(st store.Store, founder *identity.Identity, founderName string) (repoI
 	if _, err := rand.Read(repoKey); err != nil {
 		return "", fmt.Errorf("helper: read repo key: %w", err)
 	}
-	keyfile, err := crypto.WrapRepoKey(repoKey, founder.AgeRecipient())
+	keyfile, err := crypto.WrapRepoKey(0, repoKey, founder.AgeRecipient()) // generation 0
 	if err != nil {
 		return "", err
 	}
@@ -56,11 +56,12 @@ func Init(st store.Store, founder *identity.Identity, founderName string) (repoI
 	}
 	repoHex := hex.EncodeToString(repoID)
 	gen := &roster.Roster{
-		RepoID:         repoHex,
-		Version:        0, // genesis = v0 (§2)
-		PrevRosterHash: nil,
-		Members:        []roster.Member{memberFromIdentity(founder, founderName)},
-		AuthorKeyID:    founder.FingerprintHex(),
+		RepoID:            repoHex,
+		Version:           0, // genesis = v0 (§2)
+		PrevRosterHash:    nil,
+		Members:           []roster.Member{memberFromIdentity(founder, founderName)},
+		AuthorKeyID:       founder.FingerprintHex(),
+		RepoKeyGeneration: 0, // genesis generation (§B)
 	}
 	if err := gen.Sign(founder.SigningKey()); err != nil {
 		return "", err
@@ -90,10 +91,11 @@ type Engine struct {
 	repoID  []byte // raw
 	repoHex string
 
-	repoKey   []byte                      // current repo key (refreshed from the keyfile)
-	pack      *crypto.PackKeys            // current pack/manifest keys
-	knownKeys [][]byte                    // every repo key this client has held (current + historical)
-	packCache map[string]*crypto.PackKeys // derived pack keys per known repo key
+	repoKey      []byte                      // current repo key (refreshed from the keyfile)
+	kfGeneration uint64                      // generation read from the keyfile (v2, checked against the roster)
+	pack         *crypto.PackKeys            // current pack/manifest keys
+	knownKeys    [][]byte                    // every repo key this client has held (current + historical)
+	packCache    map[string]*crypto.PackKeys // derived pack keys per known repo key
 }
 
 // Open binds an Engine and derives the current pack/manifest keys from the keyfile.
@@ -125,7 +127,7 @@ func (e *Engine) refreshPackKeys() error {
 	if err != nil {
 		return fmt.Errorf("helper: get keyfile: %w", err)
 	}
-	repoKey, err := crypto.UnwrapRepoKey(keyfile, e.member.AgeIdentity())
+	generation, repoKey, err := crypto.UnwrapRepoKey(keyfile, e.member.AgeIdentity())
 	if err != nil {
 		return fmt.Errorf("helper: unwrap repo key (not a current member?): %w", err)
 	}
@@ -134,6 +136,7 @@ func (e *Engine) refreshPackKeys() error {
 		return err
 	}
 	e.repoKey = repoKey
+	e.kfGeneration = generation
 	e.pack = pack
 
 	// Accumulate this key in the member-local cache so pre-rotation packs stay
@@ -185,12 +188,31 @@ func (e *Engine) decryptPack(blob []byte) ([]byte, error) {
 	return nil, errors.New("helper: no known repo key decrypts this pack (pre-rotation history requires the old key; run a full rekey while you still hold it)")
 }
 
-// verifyManifestWithRoster enforces §4: the signer named by pusher_key_id must be a
-// member of the current trusted roster, and the Ed25519 signature must verify under
-// that member's key.
-// SECURITY-REVIEW (§4, §7.3): membership in the trusted roster is the signature
-// gate; a removed member's signature is rejected because they are no longer present.
-func (e *Engine) verifyManifestWithRoster(m *manifest.Manifest, trusted *roster.Roster) error {
+// checkKeyfileGeneration enforces m2: the generation embedded in the keyfile (read
+// in refreshPackKeys) MUST equal the current trusted roster's repo_key_generation,
+// otherwise the keyfile is stale/forged (a downgrade) and is rejected.
+// SECURITY-REVIEW (m2): binds the keyfile to the roster's repo_key generation.
+func (e *Engine) checkKeyfileGeneration(trusted *roster.Roster) error {
+	if e.kfGeneration != trusted.RepoKeyGeneration {
+		return fmt.Errorf("helper: keyfile generation %d does not match roster generation %d (stale/forged keyfile)",
+			e.kfGeneration, trusted.RepoKeyGeneration)
+	}
+	return nil
+}
+
+// verifyManifestWithRoster enforces §4 + m1: the manifest's roster_hash MUST equal
+// the hash of the current trusted roster, the signer named by pusher_key_id MUST be
+// a member of that roster, and the Ed25519 signature must verify under their key.
+// SECURITY-REVIEW (m1): roster_hash binds the manifest to a specific roster, so a
+// manifest produced under a different (e.g. older) roster — even one signed by a
+// then-valid, since-removed member — is rejected (cross-roster splice closed).
+// SECURITY-REVIEW (§4): roster membership is the signature gate; a removed member is
+// rejected because they are no longer present.
+func (e *Engine) verifyManifestWithRoster(m *manifest.Manifest, trusted *roster.Roster, trustedHash string) error {
+	if m.RosterHash != trustedHash {
+		return fmt.Errorf("helper: manifest roster_hash %s does not match current roster %s (cross-roster splice?)",
+			m.RosterHash, trustedHash)
+	}
 	signer, ok := trusted.FindByFingerprint(m.PusherKeyID)
 	if !ok {
 		return fmt.Errorf("helper: manifest signer %s is not in the current roster", m.PusherKeyID)
@@ -209,7 +231,7 @@ type current struct {
 	hash     string // SHA-256 of the canonical plaintext (empty when none)
 }
 
-func (e *Engine) loadCurrent(trusted *roster.Roster) (*current, error) {
+func (e *Engine) loadCurrent(trusted *roster.Roster, trustedHash string) (*current, error) {
 	blob, version, err := e.store.GetManifest()
 	if err != nil {
 		return nil, err
@@ -225,7 +247,7 @@ func (e *Engine) loadCurrent(trusted *roster.Roster) (*current, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := e.verifyManifestWithRoster(m, trusted); err != nil {
+	if err := e.verifyManifestWithRoster(m, trusted, trustedHash); err != nil {
 		return nil, err
 	}
 	return &current{manifest: m, version: version, hash: util.SHA256Hex(plain)}, nil
@@ -276,8 +298,11 @@ func (e *Engine) Push(refs []string) error {
 	if err := e.refreshPackKeys(); err != nil {
 		return err
 	}
-	trusted, _, err := e.loadTrustedRoster()
+	trusted, trustedHash, err := e.loadTrustedRoster()
 	if err != nil {
+		return err
+	}
+	if err := e.checkKeyfileGeneration(trusted); err != nil {
 		return err
 	}
 	if _, ok := trusted.FindByFingerprint(e.member.FingerprintHex()); !ok {
@@ -309,7 +334,7 @@ func (e *Engine) Push(refs []string) error {
 
 	var lastErr error
 	for attempt := 0; attempt < maxPushRetries; attempt++ {
-		cur, err := e.loadCurrent(trusted)
+		cur, err := e.loadCurrent(trusted, trustedHash)
 		if err != nil {
 			return err
 		}
@@ -355,9 +380,10 @@ func (e *Engine) Push(refs []string) error {
 			Refs:             newRefs,
 			Packs:            newPacks,
 			PusherKeyID:      e.member.FingerprintHex(),
+			RosterHash:       trustedHash, // m1: bind this push to the current roster
 		}
 		// SECURITY-REVIEW (§7.2): sign-then-encrypt — sign the sig-less canonical
-		// bytes (which cover repo_id, version, prev_manifest_hash), then encrypt.
+		// bytes (which cover repo_id, version, prev_manifest_hash, roster_hash), then encrypt.
 		if err := m.Sign(e.member.SigningKey()); err != nil {
 			return err
 		}
@@ -395,8 +421,13 @@ func (e *Engine) Fetch() error {
 	if err := e.refreshPackKeys(); err != nil {
 		return err
 	}
-	trusted, _, err := e.loadTrustedRoster()
+	trusted, trustedHash, err := e.loadTrustedRoster()
 	if err != nil {
+		return err
+	}
+	// m2: the keyfile's generation must match the current roster before its repo key
+	// is used to decrypt anything.
+	if err := e.checkKeyfileGeneration(trusted); err != nil {
 		return err
 	}
 
@@ -415,8 +446,9 @@ func (e *Engine) Fetch() error {
 	if err != nil {
 		return err
 	}
-	// Signer must be in the current roster, and the signature must verify (§4, §5.3).
-	if err := e.verifyManifestWithRoster(m, trusted); err != nil {
+	// m1 + §4: roster_hash must bind to the current roster, signer must be a member,
+	// and the signature must verify.
+	if err := e.verifyManifestWithRoster(m, trusted, trustedHash); err != nil {
 		return err
 	}
 	newHash := util.SHA256Hex(plain)

@@ -8,7 +8,6 @@ import (
 	"filippo.io/age"
 
 	"encgit/internal/agekey"
-	"encgit/internal/crypto"
 	"encgit/internal/identity"
 	"encgit/internal/localstate"
 	"encgit/internal/roster"
@@ -70,6 +69,13 @@ func verifyRosterSelfConsistent(r *roster.Roster) error {
 // SECURITY-REVIEW (§2, §7.2): no member key is accepted from the server without an
 // OOB-anchored chain — TOFU stands in for the human's OOB hash check, and every
 // later version is bound to the pinned roster by prev_roster_hash + author membership.
+//
+// m3 (hygiene, NOT a cryptographic barrier): this always reads the server's current
+// roster pointer (its revealed head) and advances to it when it is a valid successor,
+// so the client never operates on a roster older than the latest the server's valid
+// chain proves. It does NOT defend against a server that simply withholds the head
+// (serves a fully-consistent stale snapshot) — that residual is detectable only via
+// §5.7 pin or out-of-band comparison, never preventable against a storage adversary.
 func (e *Engine) loadTrustedRoster() (*roster.Roster, string, error) {
 	blob, _, err := e.store.GetRoster()
 	if err != nil {
@@ -78,7 +84,9 @@ func (e *Engine) loadTrustedRoster() (*roster.Roster, string, error) {
 	if blob == nil {
 		return nil, "", errors.New("helper: repository has no roster")
 	}
-	plain, err := crypto.Decrypt(blob, e.pack.Identity)
+	// Decrypt via the multi-key helper: a downgraded keyfile must not be able to hide
+	// the real (current-generation) roster from a client that holds the current key.
+	plain, err := e.decryptPack(blob)
 	if err != nil {
 		return nil, "", fmt.Errorf("helper: decrypt roster: %w", err)
 	}

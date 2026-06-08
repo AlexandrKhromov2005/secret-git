@@ -21,7 +21,7 @@ import (
 // ErrBadSignature is returned when manifest signature verification fails.
 var ErrBadSignature = errors.New("manifest: bad signature")
 
-// Manifest is the in-memory form of the §5.2 manifest object.
+// Manifest is the in-memory form of the manifest object (v2).
 type Manifest struct {
 	RepoID           string            // hex
 	Version          uint64            // strictly increasing per successful push
@@ -29,10 +29,11 @@ type Manifest struct {
 	Refs             map[string]string // ref name -> git object sha (hex)
 	Packs            []string          // ordered live pack ids (hex)
 	PusherKeyID      string            // signer fingerprint (hex)
+	RosterHash       string            // v2: hash of the roster this manifest was produced under
 	Sig              string            // base64 Ed25519 signature
 }
 
-// wire is the exact JSON shape of §5.2, used for parsing decrypted manifests.
+// wire is the exact JSON shape of the v2 manifest, used for parsing.
 type wire struct {
 	RepoID           string            `json:"repo_id"`
 	Version          uint64            `json:"version"`
@@ -40,6 +41,7 @@ type wire struct {
 	Refs             map[string]string `json:"refs"`
 	Packs            []string          `json:"packs"`
 	PusherKeyID      string            `json:"pusher_key_id"`
+	RosterHash       string            `json:"roster_hash"`
 	Sig              string            `json:"sig"`
 }
 
@@ -60,6 +62,7 @@ func (m *Manifest) fields(includeSig bool) map[string]any {
 		"refs":          refs,
 		"packs":         packs,
 		"pusher_key_id": m.PusherKeyID,
+		"roster_hash":   m.RosterHash, // v2: signed binding to the roster (m1)
 	}
 	if m.PrevManifestHash == nil {
 		obj["prev_manifest_hash"] = nil
@@ -144,6 +147,7 @@ func Parse(plaintext []byte) (*Manifest, error) {
 		Refs:             w.Refs,
 		Packs:            w.Packs,
 		PusherKeyID:      w.PusherKeyID,
+		RosterHash:       w.RosterHash,
 		Sig:              w.Sig,
 	}, nil
 }

@@ -12,6 +12,7 @@ package crypto
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 
@@ -83,15 +84,40 @@ func Decrypt(blob []byte, identities ...age.Identity) ([]byte, error) {
 	return out, nil
 }
 
-// WrapRepoKey produces the keyfile blob: age.Encrypt(repo_key, recipients) (§3).
-func WrapRepoKey(repoKey []byte, recipients ...age.Recipient) ([]byte, error) {
+// keyfilePayloadLen is the fixed keyfile-v2 plaintext length: 8-byte big-endian
+// repo_key_generation followed by the 32-byte repo key.
+const keyfilePayloadLen = 8 + 32
+
+// WrapRepoKey produces the keyfile-v2 blob (§C): the payload is
+// uint64-BE(generation) || repo_key_32, encrypted with age to the members.
+// SECURITY-REVIEW (m2): the generation lives INSIDE the age-AEAD-protected payload,
+// so the server cannot re-stamp it without breaking decryption. This is a fixed
+// binary layout, not a hand-rolled AEAD — age provides the AEAD.
+func WrapRepoKey(generation uint64, repoKey []byte, recipients ...age.Recipient) ([]byte, error) {
 	if len(recipients) == 0 {
 		return nil, fmt.Errorf("crypto: keyfile needs at least one recipient")
 	}
-	return Encrypt(repoKey, recipients...)
+	if len(repoKey) != 32 {
+		return nil, fmt.Errorf("crypto: repo key must be 32 bytes, got %d", len(repoKey))
+	}
+	payload := make([]byte, keyfilePayloadLen)
+	binary.BigEndian.PutUint64(payload[:8], generation)
+	copy(payload[8:], repoKey)
+	return Encrypt(payload, recipients...)
 }
 
-// UnwrapRepoKey recovers the repo key from the keyfile using a member identity.
-func UnwrapRepoKey(keyfile []byte, id age.Identity) ([]byte, error) {
-	return Decrypt(keyfile, id)
+// UnwrapRepoKey recovers the generation and repo key from a keyfile-v2 blob using a
+// member identity. An AEAD failure is fatal (returned as an error); a wrong payload
+// length is rejected.
+func UnwrapRepoKey(keyfile []byte, id age.Identity) (generation uint64, repoKey []byte, err error) {
+	payload, err := Decrypt(keyfile, id)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(payload) != keyfilePayloadLen {
+		return 0, nil, fmt.Errorf("crypto: keyfile payload must be %d bytes, got %d", keyfilePayloadLen, len(payload))
+	}
+	generation = binary.BigEndian.Uint64(payload[:8])
+	repoKey = append([]byte(nil), payload[8:]...)
+	return generation, repoKey, nil
 }

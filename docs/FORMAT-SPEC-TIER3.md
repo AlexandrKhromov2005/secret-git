@@ -6,6 +6,56 @@
 > final freeze; implementation follows the contract and marks them `// SECURITY-REVIEW`.
 > Implementation-level decisions are in [`../FORMAT-NOTES.md`](../FORMAT-NOTES.md).
 
+## v2 — closes the cross-roster splice (manifest v1→v2, roster/keyfile v2)
+
+A red-team review found a real High-severity attack: **cross-roster splice** — reanimating a
+removed member's manifest against a lagging client by mixing the three independent server-held
+pointers (roster, keyfile, manifest). v2 binds them. **There is no backward compatibility**:
+pre-v2 repositories are re-initialized.
+
+- **Manifest v2 — new signed field `"roster_hash"`** (hex): SHA-256 of the canonical PLAINTEXT of
+  the roster the manifest was produced under (the same value as that roster's `prev_roster_hash`
+  successor / pin). It is part of the signed JCS bytes (alongside all fields except `sig`); the
+  canonical-key order places it between `repo_id` and `sig`. sign-then-encrypt and JCS are unchanged.
+- **Roster v2 — new signed field `"repo_key_generation"`** (`uint64`): the generation of the repo
+  key. Genesis (roster v0) = 0; incremented **only** on a repo-key rotation (remove with minimal
+  rotation; full rekey). It does **not** change on add or on ordinary pushes. (The roster `version`
+  is its own membership-change counter, separate from `repo_key_generation`.)
+- **Keyfile v2 — generation inside the AEAD payload**: the keyfile plaintext is now
+  `uint64-BE(repo_key_generation) ‖ repo_key_32` (40 bytes), then `age.Encrypt(...)`. The age-AEAD
+  protects the generation so the server cannot re-stamp it. This is a fixed binary layout, not a
+  hand-rolled AEAD.
+
+### Manifest acceptance v2 (rule D — order matters), on fetch
+1. **Advance + pin the roster**: read the roster pointer, validate the chain (author ∈ previous
+   roster, `prev_roster_hash`, version increases), update the local pin → the CURRENT trusted roster.
+2. **Unwrap the keyfile and read its generation.** `// SECURITY-REVIEW (m2)`: the keyfile generation
+   MUST equal `repo_key_generation` in the current trusted roster, else the keyfile is stale/forged
+   (downgrade) → REJECT. Only on a match is the unwrapped repo key used as current.
+3. **Decrypt the manifest** under the current repo key and verify the signature with the member whose
+   fingerprint == `pusher_key_id`. `// SECURITY-REVIEW (m1)`: the manifest's `roster_hash` MUST equal
+   the hash of the current trusted roster (step 1), AND the signer MUST be a member of it, else
+   REJECT. Then check the `version`/`prev_manifest_hash` chain (§5.7 v1).
+
+### Consequence E — re-issue the manifest on every roster change
+Because the manifest is bound to the CURRENT roster, any membership change MUST re-issue the current
+manifest with the new `roster_hash`:
+- **add**: same repo key → re-issue (new version, chained) with the new roster's hash, under the same key.
+- **remove / full rekey**: new repo key → re-issue under the new key AND with the new roster's hash.
+- No manifest yet (fresh repo before the first push) → skip; the first push carries the current `roster_hash`.
+
+### m3 — recommended hygiene (NOT a security barrier)
+On each operation the client best-effort reads the server's roster head and refuses to operate on a
+roster older than the latest a valid server chain proves. This shrinks the equivocation window
+against a lagging client but does NOT eliminate it (the server may simply never publish the head).
+It is explicitly not a cryptographic barrier.
+
+### Residual risk (stated plainly)
+m1 + m2 reduce the splice to pure §5.7-style **equivocation** against a *fully frozen* lagging
+participant (old roster + old keyfile + old key, all at generation G, internally consistent). That is
+unpreventable against an adversary that owns storage — only **detectable** on synchronization and via
+out-of-band comparison; m3 catches it only when the roster head is visible.
+
 ## 0. Two layers and threat model
 - **Roster = cryptographic membership**: whose manifest signatures are accepted (members'
   Ed25519 keys) and to whom the repo key is wrapped (members' X25519 keys). This is the security

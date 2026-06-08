@@ -79,12 +79,13 @@ func decodeRaw32(s string) ([]byte, error) {
 
 // Roster is the in-memory form of the §1.2 roster object.
 type Roster struct {
-	RepoID         string
-	Version        uint64
-	PrevRosterHash *string // hex, or nil for genesis (v0)
-	Members        []Member
-	AuthorKeyID    string // fingerprint hex of the signer
-	Sig            string // base64 Ed25519
+	RepoID            string
+	Version           uint64
+	PrevRosterHash    *string // hex, or nil for genesis (v0)
+	Members           []Member
+	AuthorKeyID       string // fingerprint hex of the signer
+	RepoKeyGeneration uint64 // v2: repo_key generation; 0 at genesis, +1 only on repo-key rotation
+	Sig               string // base64 Ed25519
 }
 
 // sortedMembers returns the members ordered by fingerprint (§1.2 determinism).
@@ -123,10 +124,11 @@ func (r *Roster) fields(includeSig bool) (map[string]any, error) {
 		}
 	}
 	obj := map[string]any{
-		"repo_id":       r.RepoID,
-		"version":       r.Version,
-		"members":       members,
-		"author_key_id": r.AuthorKeyID,
+		"repo_id":             r.RepoID,
+		"version":             r.Version,
+		"members":             members,
+		"author_key_id":       r.AuthorKeyID,
+		"repo_key_generation": r.RepoKeyGeneration, // v2: signed generation (m2 binding)
 	}
 	if r.PrevRosterHash == nil {
 		obj["prev_roster_hash"] = nil
@@ -218,8 +220,9 @@ type wireRoster struct {
 		X25519Pub  string `json:"x25519_pub"`
 		Ed25519Pub string `json:"ed25519_pub"`
 	} `json:"members"`
-	AuthorKeyID string `json:"author_key_id"`
-	Sig         string `json:"sig"`
+	AuthorKeyID       string `json:"author_key_id"`
+	RepoKeyGeneration uint64 `json:"repo_key_generation"`
+	Sig               string `json:"sig"`
 }
 
 // Parse decodes a decrypted roster plaintext.
@@ -231,11 +234,12 @@ func Parse(plaintext []byte) (*Roster, error) {
 		return nil, fmt.Errorf("roster: parse: %w", err)
 	}
 	r := &Roster{
-		RepoID:         w.RepoID,
-		Version:        w.Version,
-		PrevRosterHash: w.PrevRosterHash,
-		AuthorKeyID:    w.AuthorKeyID,
-		Sig:            w.Sig,
+		RepoID:            w.RepoID,
+		Version:           w.Version,
+		PrevRosterHash:    w.PrevRosterHash,
+		AuthorKeyID:       w.AuthorKeyID,
+		RepoKeyGeneration: w.RepoKeyGeneration,
+		Sig:               w.Sig,
 	}
 	for _, m := range w.Members {
 		r.Members = append(r.Members, Member{Name: m.Name, X25519Pub: m.X25519Pub, Ed25519Pub: m.Ed25519Pub})
