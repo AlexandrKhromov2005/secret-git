@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/base64"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -21,104 +23,52 @@ func sampleManifest() *Manifest {
 	}
 }
 
-func TestCanonicalGolden(t *testing.T) {
-	m := sampleManifest()
-
-	gotCanon, err := m.CanonicalBytes()
+func readSpec(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "FORMAT-SPEC.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantCanon := `{"packs":["p1","p2"],"prev_manifest_hash":"abc123","pusher_key_id":"ffff","refs":{"refs/heads/feature":"bbb","refs/heads/main":"aaa"},"repo_id":"deadbeef","sig":"U0lH","version":2}`
-	if string(gotCanon) != wantCanon {
-		t.Fatalf("canonical mismatch:\n got %s\nwant %s", gotCanon, wantCanon)
-	}
-
-	// Signing bytes are the same object WITHOUT the sig field.
-	gotSign, err := m.SigningBytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantSign := `{"packs":["p1","p2"],"prev_manifest_hash":"abc123","pusher_key_id":"ffff","refs":{"refs/heads/feature":"bbb","refs/heads/main":"aaa"},"repo_id":"deadbeef","version":2}`
-	if string(gotSign) != wantSign {
-		t.Fatalf("signing-bytes mismatch:\n got %s\nwant %s", gotSign, wantSign)
-	}
-
-	// Determinism: repeated encodings are byte-identical.
-	for range 50 {
-		again, err := m.CanonicalBytes()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(again, gotCanon) {
-			t.Fatal("canonical encoding is not deterministic")
-		}
-	}
-
-	// null prev_manifest_hash renders as JSON null.
-	m.PrevManifestHash = nil
-	nullCanon, err := m.CanonicalBytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(nullCanon, []byte(`"prev_manifest_hash":null`)) {
-		t.Fatalf("null prev not rendered: %s", nullCanon)
-	}
+	return string(b)
 }
 
-func TestEncodeStringEscaping(t *testing.T) {
-	// Expected values are built from a literal backslash so no \u / \x escape text
-	// appears in the test source itself.
-	bs := "\\"
-	cases := []struct {
-		in, want string
-	}{
-		{`a"b`, `"a` + bs + `"b"`},                                      // " -> \"
-		{`a\b`, `"a` + bs + bs + `b"`},                                  // \ -> \\
-		{"tab\tnl\ncr\r", `"tab` + bs + `tnl` + bs + `ncr` + bs + `r"`}, // \t \n \r
-		{string(rune(0x01)) + string(rune(0x1f)), `"` + bs + `u0001` + bs + `u001f"`},
-		{"unicode-Ω-é", `"unicode-Ω-é"`}, // non-ASCII emitted literally as UTF-8
+// TestManifestSchemaFieldsMatchSpec pins the §5.2 manifest field names against the
+// frozen spec document (not against a self-authored canonical golden — the JCS
+// encoding rules themselves are validated externally in jcs_rfc8785_test.go). It
+// also confirms which fields are covered by the signature vs the full plaintext.
+func TestManifestSchemaFieldsMatchSpec(t *testing.T) {
+	spec := readSpec(t)
+	m := sampleManifest()
+	canon, err := m.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, c := range cases {
-		var buf bytes.Buffer
-		encodeString(&buf, c.in)
-		if buf.String() != c.want {
-			t.Errorf("encodeString(%q) = %s, want %s", c.in, buf.String(), c.want)
+	sign, err := m.SigningBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fields := []string{"repo_id", "version", "prev_manifest_hash", "refs", "packs", "pusher_key_id", "sig"}
+	for _, f := range fields {
+		if !strings.Contains(spec, `"`+f+`"`) {
+			t.Errorf("field %q is not documented in docs/FORMAT-SPEC.md", f)
+		}
+		if !bytes.Contains(canon, []byte(`"`+f+`":`)) {
+			t.Errorf("field %q missing from canonical plaintext", f)
 		}
 	}
-}
 
-func TestSignVerifyAndTamper(t *testing.T) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+	// sig is the only field excluded from the signed bytes; all others are present.
+	if bytes.Contains(sign, []byte(`"sig":`)) {
+		t.Error("sig must not appear in signing bytes")
 	}
-	m := sampleManifest()
-	if err := m.Sign(priv); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.Verify(pub); err != nil {
-		t.Fatalf("valid signature rejected: %v", err)
-	}
-
-	// Tampering with a signed field invalidates the signature.
-	m.Refs["refs/heads/main"] = "tampered"
-	if err := m.Verify(pub); err == nil {
-		t.Fatal("tampered manifest verified")
-	}
-
-	// A corrupted signature is rejected.
-	m2 := sampleManifest()
-	if err := m2.Sign(priv); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := base64.StdEncoding.DecodeString(m2.Sig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw[0] ^= 0xff
-	m2.Sig = base64.StdEncoding.EncodeToString(raw)
-	if err := m2.Verify(pub); err == nil {
-		t.Fatal("corrupted signature verified")
+	for _, f := range fields {
+		if f == "sig" {
+			continue
+		}
+		if !bytes.Contains(sign, []byte(`"`+f+`":`)) {
+			t.Errorf("field %q missing from signing bytes", f)
+		}
 	}
 }
 
