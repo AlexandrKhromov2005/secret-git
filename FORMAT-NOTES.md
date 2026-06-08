@@ -149,3 +149,73 @@ stay consistent. Nothing here overrides the frozen format; it pins the gaps.
 - Fetch verifies `SHA-256(blob) == pack_id`, decrypts, then `git index-pack --stdin --fix-thin`
   into the local object store, in manifest `packs` order, then `git update-ref` for each manifest
   ref.
+
+---
+
+## Tier 3 (roster / membership) — see `docs/FORMAT-SPEC-TIER3.md`
+
+Decisions taken within the freedom of the frozen Tier-3 contract.
+
+### Genesis & the roster CAS pointer
+- **Genesis roster `version = 0`** (`prev_roster_hash = null`), per §2's "roster v0". Because 0 is a
+  real version, the store signals "no roster" by a **nil blob**, not by `version == 0` (unlike the
+  manifest, whose first version is 1). `localstate.State.RosterPinned` likewise distinguishes
+  "genesis v0 accepted" from "no roster seen".
+- The roster is a second CAS pointer in the `store` interface (`GetRoster`/`CASRoster`), mirroring the
+  manifest. `DeleteBlob` was added for full rekey. Tier 4 swaps in an HTTP implementation unchanged.
+
+### Serialization reuse
+- The roster reuses the **externally-validated** manifest JCS encoder via the exported
+  `manifest.CanonicalJSON`. `encodeValue` gained a `[]any` case (arrays of objects) for the
+  `members` list; this is **additive** — manifests never use `[]any`, so v1 manifest bytes are
+  byte-identical, and the RFC 8785 reference vectors still pass.
+- `members` are sorted by **fingerprint** inside `fields()`, so canonical bytes are independent of
+  input order (§1.2). Member public keys are lowercase hex of the raw 32 bytes; the fingerprint is
+  the same `SHA-256(x25519_pub_raw32 || ed25519_pub_raw32)` as §2.
+
+### Roster trust, pin, and anchoring
+- The first roster a client sees is **trust-on-first-use** (the §2 anchoring reduction; in a real
+  join the human OOB-compares `roster_hash`). The locally-trusted roster **content** is stored in
+  `localstate` (not just the pin hash), because verifying the next version's `author ∈ roster v(n-1)`
+  and accepting manifest signers both need the trusted member set.
+- A newer roster is accepted only as the **direct authorized successor** of the pin:
+  `new.prev_roster_hash == pinned.roster_hash` AND `new.author_key_id ∈ pinned.members`, signature
+  verified with that author's key. Same-version-different-hash → equivocation; lower version →
+  rollback. Missing intermediate roster versions break the chain (re-anchor OOB needed) — the same
+  limitation as the manifest §5.7, by design.
+
+### Engine integration
+- The engine **refreshes the repo key from the keyfile on every operation** (`refreshPackKeys`), so a
+  repo-key rotation by another member is picked up transparently and a removed member's unwrap fails
+  fast (at `Open`).
+- Manifest acceptance (§4): the signer named by `pusher_key_id` must be in the current trusted roster,
+  verified with that member's Ed25519 key. `Init` creates the genesis roster so single-member v1 flows
+  keep working (the founder is in the roster).
+
+### Add / Remove / Full rekey
+- **Add** requires an explicit OOB fingerprint argument that must equal the new member's
+  `SHA-256(x_pub || ed_pub)` BEFORE the repo key is wrapped to them (§7.5 gate). Add does not rotate.
+- **Remove** = minimal rotation: new roster without C encrypted to the NEW `pub_pack'`, keyfile rewrapped
+  to the remaining members under the new key, AND the current manifest **re-published under the new key**
+  (same refs/packs) so it stays readable — the invariant is that the current manifest & roster are always
+  under the current repo key; only old packs stay under the old key. Both removal gates (rotation +
+  roster exclusion) are covered by `TestRemoveEnforcesBothGates`.
+- **Full rekey** re-encrypts every live pack under a fresh key, publishes a new manifest with the new
+  pack ids, deletes the old blobs, rewraps the keyfile, and re-publishes the roster under the new key.
+
+### Local key-history cache (resolves the rotation/history seam)
+- `localstate.State.RepoKeys` caches **every repo key this client has held**. The keyfile only ever
+  wraps the current key, so after a minimal rotation the old packs remain under the old key. A
+  *continuing* member retains the old key in this cache and can therefore still read pre-rotation packs
+  and run a full rekey (which must decrypt the old packs). Pack decryption tries the current key then
+  every cached key.
+- A **fresh clone / newly-added member** only ever learns the current key, so it cannot read
+  pre-rotation pack history until a full rekey re-encrypts it under the current key. This is the
+  documented minimal-rotation limitation (§3.2), now with a clear failure message rather than a raw
+  age error. (These cached keys are member-local secrets on disk, alongside the seed; in Tier 4 the
+  client would manage a keyring.)
+
+### Pending external review (§7)
+- The carried-over §7 v1 items (age-recipient equivalence, sign-then-encrypt) and the **Fork-3
+  soundness** question (roster-downgrade / cross-roster splice) are external-review items, implemented
+  as written and marked `// SECURITY-REVIEW`. They are NOT decided here.
