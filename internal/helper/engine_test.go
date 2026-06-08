@@ -158,7 +158,7 @@ func TestPushFetchEndToEnd(t *testing.T) {
 	root := t.TempDir()
 	st := openStore(t, filepath.Join(root, "store"))
 	member := newMember(t)
-	repoID, err := helper.Init(st, member)
+	repoID, err := helper.Init(st, member, "founder")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestCASConflictRebaseRetry(t *testing.T) {
 	root := t.TempDir()
 	st := openStore(t, filepath.Join(root, "store"))
 	member := newMember(t)
-	repoID, err := helper.Init(st, member)
+	repoID, err := helper.Init(st, member, "founder")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestRollbackDetected(t *testing.T) {
 	root := t.TempDir()
 	st := openStore(t, filepath.Join(root, "store"))
 	member := newMember(t)
-	repoID, err := helper.Init(st, member)
+	repoID, err := helper.Init(st, member, "founder")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +325,7 @@ func TestEquivocationDetected(t *testing.T) {
 	root := t.TempDir()
 	st := openStore(t, filepath.Join(root, "store"))
 	member := newMember(t)
-	repoID, err := helper.Init(st, member)
+	repoID, err := helper.Init(st, member, "founder")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestBadSignatureRejected(t *testing.T) {
 	root := t.TempDir()
 	st := openStore(t, filepath.Join(root, "store"))
 	member := newMember(t)
-	repoID, err := helper.Init(st, member)
+	repoID, err := helper.Init(st, member, "founder")
 	if err != nil {
 		t.Fatal(err)
 	}

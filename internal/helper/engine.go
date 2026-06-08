@@ -1,7 +1,9 @@
-// Package helper is the Tier-1 push/fetch engine: it orchestrates git plumbing,
-// the age crypto layer, the signed manifest, the store, and the local anti-rollback
-// state to implement §5.4 (push), §5.5 (fetch), §5.6 (CAS + rebase-retry), and
-// §5.7 (rollback/equivocation detection) of the frozen format.
+// Package helper is the push/fetch engine. On top of the frozen v1 manifest flow
+// (§5.4 push, §5.5 fetch, §5.6 CAS + rebase-retry, §5.7 rollback/equivocation) it
+// adds the Tier-3 roster: manifest signers must be in the current trusted roster,
+// the roster is a second CAS-guarded encrypted pointer with its own anti-rollback
+// pin, and membership changes (add/remove/full-rekey) update the keyfile and, on
+// removal, rotate the repo key.
 //
 // This is the engine the (Tier 4) git-remote-encgit / HTTP helper will sit on top
 // of; here it runs directly against the local store stub.
@@ -17,6 +19,7 @@ import (
 	"encgit/internal/identity"
 	"encgit/internal/localstate"
 	"encgit/internal/manifest"
+	"encgit/internal/roster"
 	"encgit/internal/store"
 	"encgit/internal/util"
 )
@@ -27,12 +30,10 @@ const RepoIDLen = 16
 // maxPushRetries bounds the CAS rebase-retry loop (§5.6).
 const maxPushRetries = 16
 
-// Init creates a fresh repository in the store: it generates repo_id and the repo
-// key, wraps the repo key to the single founding member (the keyfile, §3), and
-// stores it. It returns the new repo_id as hex (the caller persists it as repo
-// coordinates; it is not part of the encrypted format). No manifest exists yet —
-// the first push creates version 1.
-func Init(st store.Store, member *identity.Identity) (repoIDHex string, err error) {
+// Init creates a fresh repository: it generates repo_id and the repo key, wraps the
+// repo key to the founding member (the keyfile, §3), and publishes the genesis
+// roster v0 = {founder} (§2). It returns the new repo_id as hex.
+func Init(st store.Store, founder *identity.Identity, founderName string) (repoIDHex string, err error) {
 	repoID := make([]byte, RepoIDLen)
 	if _, err := rand.Read(repoID); err != nil {
 		return "", fmt.Errorf("helper: read repo_id: %w", err)
@@ -41,18 +42,46 @@ func Init(st store.Store, member *identity.Identity) (repoIDHex string, err erro
 	if _, err := rand.Read(repoKey); err != nil {
 		return "", fmt.Errorf("helper: read repo key: %w", err)
 	}
-	keyfile, err := crypto.WrapRepoKey(repoKey, member.AgeRecipient())
+	keyfile, err := crypto.WrapRepoKey(repoKey, founder.AgeRecipient())
 	if err != nil {
 		return "", err
 	}
 	if err := st.PutKeyfile(keyfile); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(repoID), nil
+
+	pack, err := crypto.DerivePackKeys(repoKey, repoID)
+	if err != nil {
+		return "", err
+	}
+	repoHex := hex.EncodeToString(repoID)
+	gen := &roster.Roster{
+		RepoID:         repoHex,
+		Version:        0, // genesis = v0 (§2)
+		PrevRosterHash: nil,
+		Members:        []roster.Member{memberFromIdentity(founder, founderName)},
+		AuthorKeyID:    founder.FingerprintHex(),
+	}
+	if err := gen.Sign(founder.SigningKey()); err != nil {
+		return "", err
+	}
+	plain, err := gen.Marshal()
+	if err != nil {
+		return "", err
+	}
+	blob, err := crypto.Encrypt(plain, pack.Recipient)
+	if err != nil {
+		return "", err
+	}
+	if err := st.CASRoster(0, blob, 0); err != nil {
+		return "", fmt.Errorf("helper: publish genesis roster: %w", err)
+	}
+	return repoHex, nil
 }
 
 // Engine binds a local git repo, a store, local state, and a member identity to a
-// specific repo_id, with the pack/manifest keys derived from the unwrapped repo key.
+// specific repo_id. The repo key and pack/manifest keys are refreshed from the
+// keyfile on each operation so the engine follows repo-key rotations transparently.
 type Engine struct {
 	gitDir  string
 	store   store.Store
@@ -60,48 +89,117 @@ type Engine struct {
 	member  *identity.Identity
 	repoID  []byte // raw
 	repoHex string
-	pack    *crypto.PackKeys
+
+	repoKey   []byte                      // current repo key (refreshed from the keyfile)
+	pack      *crypto.PackKeys            // current pack/manifest keys
+	knownKeys [][]byte                    // every repo key this client has held (current + historical)
+	packCache map[string]*crypto.PackKeys // derived pack keys per known repo key
 }
 
-// Open binds an Engine. It unwraps the repo key from the keyfile with the member's
-// X25519 identity and derives the pack/manifest recipient from (repo key, repo_id).
+// Open binds an Engine and derives the current pack/manifest keys from the keyfile.
 func Open(gitDir string, st store.Store, state *localstate.Store, member *identity.Identity, repoIDHex string) (*Engine, error) {
 	repoID, err := hex.DecodeString(repoIDHex)
 	if err != nil {
 		return nil, fmt.Errorf("helper: bad repo_id hex: %w", err)
 	}
-	keyfile, err := st.GetKeyfile()
-	if err != nil {
-		return nil, fmt.Errorf("helper: get keyfile: %w", err)
-	}
-	repoKey, err := crypto.UnwrapRepoKey(keyfile, member.AgeIdentity())
-	if err != nil {
-		return nil, fmt.Errorf("helper: unwrap repo key: %w", err)
-	}
-	pack, err := crypto.DerivePackKeys(repoKey, repoID)
-	if err != nil {
-		return nil, err
-	}
-	return &Engine{
+	e := &Engine{
 		gitDir:  gitDir,
 		store:   st,
 		state:   state,
 		member:  member,
 		repoID:  repoID,
 		repoHex: hex.EncodeToString(repoID),
-		pack:    pack,
-	}, nil
+	}
+	if err := e.refreshPackKeys(); err != nil {
+		return nil, err
+	}
+	return e, nil
 }
 
-// verifyManifest checks the signature against a known member. In v1 the only known
-// member is the local one (self); the full roster is Tier 3.
-// SECURITY-REVIEW (§5.3): the signer named by pusher_key_id must be a known member
-// (here: among the local member set) before its Ed25519 key is trusted to verify.
-func (e *Engine) verifyManifest(m *manifest.Manifest) error {
-	if m.PusherKeyID != e.member.FingerprintHex() {
-		return fmt.Errorf("helper: manifest signed by unknown member %s", m.PusherKeyID)
+// refreshPackKeys re-reads the keyfile, unwraps the current repo key with the
+// member's X25519 identity, and re-derives the pack/manifest keys. Called at the
+// start of each operation so a repo-key rotation by another member is picked up
+// (and so a removed member's unwrap fails fast).
+func (e *Engine) refreshPackKeys() error {
+	keyfile, err := e.store.GetKeyfile()
+	if err != nil {
+		return fmt.Errorf("helper: get keyfile: %w", err)
 	}
-	return m.Verify(e.member.VerifyKey())
+	repoKey, err := crypto.UnwrapRepoKey(keyfile, e.member.AgeIdentity())
+	if err != nil {
+		return fmt.Errorf("helper: unwrap repo key (not a current member?): %w", err)
+	}
+	pack, err := crypto.DerivePackKeys(repoKey, e.repoID)
+	if err != nil {
+		return err
+	}
+	e.repoKey = repoKey
+	e.pack = pack
+
+	// Accumulate this key in the member-local cache so pre-rotation packs stay
+	// readable to a continuing member (see localstate.State.RepoKeys).
+	st, _, err := e.state.Load()
+	if err != nil {
+		return err
+	}
+	if !st.HasKey(repoKey) {
+		st.AddKey(repoKey)
+		if err := e.state.Save(st); err != nil {
+			return err
+		}
+	}
+	e.knownKeys = st.RepoKeys
+	e.packCache = map[string]*crypto.PackKeys{hex.EncodeToString(repoKey): pack}
+	return nil
+}
+
+// packKeysFor returns (and caches) the pack/manifest keys for a known repo key.
+func (e *Engine) packKeysFor(key []byte) (*crypto.PackKeys, error) {
+	h := hex.EncodeToString(key)
+	if pk, ok := e.packCache[h]; ok {
+		return pk, nil
+	}
+	pk, err := crypto.DerivePackKeys(key, e.repoID)
+	if err != nil {
+		return nil, err
+	}
+	e.packCache[h] = pk
+	return pk, nil
+}
+
+// decryptPack decrypts a pack blob, trying the current key first and then every
+// historical key this client holds (packs may predate a repo-key rotation, §3.2).
+func (e *Engine) decryptPack(blob []byte) ([]byte, error) {
+	if out, err := crypto.Decrypt(blob, e.pack.Identity); err == nil {
+		return out, nil
+	}
+	for _, k := range e.knownKeys {
+		pk, err := e.packKeysFor(k)
+		if err != nil {
+			continue
+		}
+		if out, err := crypto.Decrypt(blob, pk.Identity); err == nil {
+			return out, nil
+		}
+	}
+	return nil, errors.New("helper: no known repo key decrypts this pack (pre-rotation history requires the old key; run a full rekey while you still hold it)")
+}
+
+// verifyManifestWithRoster enforces §4: the signer named by pusher_key_id must be a
+// member of the current trusted roster, and the Ed25519 signature must verify under
+// that member's key.
+// SECURITY-REVIEW (§4, §7.3): membership in the trusted roster is the signature
+// gate; a removed member's signature is rejected because they are no longer present.
+func (e *Engine) verifyManifestWithRoster(m *manifest.Manifest, trusted *roster.Roster) error {
+	signer, ok := trusted.FindByFingerprint(m.PusherKeyID)
+	if !ok {
+		return fmt.Errorf("helper: manifest signer %s is not in the current roster", m.PusherKeyID)
+	}
+	pub, err := signer.EdPub()
+	if err != nil {
+		return err
+	}
+	return m.Verify(pub)
 }
 
 // current is a decrypted+verified snapshot of the live manifest (or empty).
@@ -111,7 +209,7 @@ type current struct {
 	hash     string // SHA-256 of the canonical plaintext (empty when none)
 }
 
-func (e *Engine) loadCurrent() (*current, error) {
+func (e *Engine) loadCurrent(trusted *roster.Roster) (*current, error) {
 	blob, version, err := e.store.GetManifest()
 	if err != nil {
 		return nil, err
@@ -127,15 +225,14 @@ func (e *Engine) loadCurrent() (*current, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := e.verifyManifest(m); err != nil {
+	if err := e.verifyManifestWithRoster(m, trusted); err != nil {
 		return nil, err
 	}
 	return &current{manifest: m, version: version, hash: util.SHA256Hex(plain)}, nil
 }
 
 // importPack downloads one pack blob, verifies SHA-256(blob)==pack_id (§5.5 step 3),
-// decrypts it, and feeds the objects into the local git object store. It does not
-// touch refs or local state; callers track which packs they have imported.
+// decrypts it, and feeds the objects into the local git object store.
 func (e *Engine) importPack(packID string) error {
 	packBlob, err := e.store.GetBlob(packID)
 	if err != nil {
@@ -146,7 +243,7 @@ func (e *Engine) importPack(packID string) error {
 		// the ciphertext; a mismatch means the blob was substituted/tampered.
 		return fmt.Errorf("helper: pack id mismatch: want %s got %s", packID, got)
 	}
-	rawPack, err := crypto.Decrypt(packBlob, e.pack.Identity)
+	rawPack, err := e.decryptPack(packBlob)
 	if err != nil {
 		return fmt.Errorf("helper: decrypt pack %s: %w", packID, err)
 	}
@@ -157,9 +254,8 @@ func (e *Engine) importPack(packID string) error {
 }
 
 // ensureLocalObjects imports any of the current manifest's packs whose objects are
-// not yet in the local repo (tracked via st.ImportedPacks). This is what makes the
-// CAS rebase work: §5.6 says a conflicted pusher fetches the fresh state before
-// rebuilding, so that the current refs are usable as git "have".
+// not yet in the local repo (tracked via st.ImportedPacks), so the current refs are
+// usable as git "have" during a CAS rebase (§5.6).
 func (e *Engine) ensureLocalObjects(cur *current, st *localstate.State) error {
 	for _, p := range curPacks(cur) {
 		if st.HasPack(p) {
@@ -173,15 +269,22 @@ func (e *Engine) ensureLocalObjects(cur *current, st *localstate.State) error {
 	return nil
 }
 
-// Push implements §5.4: gather new objects into one encrypted pack, build a signed
-// encrypted manifest at version N+1, and CAS-swap it; on a version conflict it
-// fetches the fresh manifest, rebases on it, and retries (§5.6).
-//
-// refs are the local ref names to publish (e.g. "refs/heads/main"); empty means all
-// refs under refs/heads. Refs already in the manifest that are not pushed are kept.
+// Push implements §5.4 with the Tier-3 acceptance rule: the pusher (self) must be in
+// the current roster, and the manifest is signed by self. On a version conflict it
+// fetches the fresh manifest, rebases, and retries (§5.6).
 func (e *Engine) Push(refs []string) error {
+	if err := e.refreshPackKeys(); err != nil {
+		return err
+	}
+	trusted, _, err := e.loadTrustedRoster()
+	if err != nil {
+		return err
+	}
+	if _, ok := trusted.FindByFingerprint(e.member.FingerprintHex()); !ok {
+		return errors.New("helper: cannot push: you are not in the current roster")
+	}
+
 	if len(refs) == 0 {
-		var err error
 		if refs, err = listHeadRefs(e.gitDir); err != nil {
 			return err
 		}
@@ -190,7 +293,6 @@ func (e *Engine) Push(refs []string) error {
 		}
 	}
 
-	// Resolve the refs being pushed to their object ids once up front.
 	wantRefs := make(map[string]string, len(refs))
 	for _, ref := range refs {
 		sha, err := revParse(e.gitDir, ref)
@@ -207,18 +309,14 @@ func (e *Engine) Push(refs []string) error {
 
 	var lastErr error
 	for attempt := 0; attempt < maxPushRetries; attempt++ {
-		cur, err := e.loadCurrent()
+		cur, err := e.loadCurrent(trusted)
 		if err != nil {
 			return err
 		}
-
-		// Make sure the objects behind the current refs exist locally (needed as
-		// git "have"), importing any packs from a competing push we lack.
 		if err := e.ensureLocalObjects(cur, &st); err != nil {
 			return err
 		}
 
-		// have = current manifest ref objects; want = pushed refs (kept refs merged).
 		newRefs := map[string]string{}
 		if cur.manifest != nil {
 			for k, v := range cur.manifest.Refs {
@@ -238,8 +336,6 @@ func (e *Engine) Push(refs []string) error {
 
 		newPacks := curPacks(cur)
 		if count > 0 {
-			// SECURITY-REVIEW (§7.1): pack encrypted via the repo-key-derived age
-			// recipient; pack_id is the SHA-256 of the ciphertext blob.
 			blob, err := crypto.Encrypt(pack, e.pack.Recipient)
 			if err != nil {
 				return err
@@ -278,14 +374,13 @@ func (e *Engine) Push(refs []string) error {
 		err = e.store.CASManifest(cur.version, manifestBlob, cur.version+1)
 		if errors.Is(err, store.ErrVersionConflict) {
 			lastErr = err
-			_ = e.state.Save(st) // persist imported-pack progress before retrying
-			continue             // rebase on the fresh manifest and retry (§5.6)
+			_ = e.state.Save(st)
+			continue
 		}
 		if err != nil {
 			return err
 		}
 
-		// Success: advance the local pin to what we just pushed.
 		st.Version = m.Version
 		st.ManifestHash = newHash
 		return e.state.Save(st)
@@ -293,10 +388,18 @@ func (e *Engine) Push(refs []string) error {
 	return fmt.Errorf("helper: push gave up after %d version conflicts: %w", maxPushRetries, lastErr)
 }
 
-// Fetch implements §5.5: download+decrypt+verify the manifest, run the §5.7
-// freshness/rollback checks against the local pin, import any missing packs
-// (verifying SHA-256(blob)==pack_id), and update local refs from the manifest.
+// Fetch implements §5.5 with the Tier-3 acceptance rule (§4): advance the trusted
+// roster, then require the manifest signer to be in it, run §5.7 freshness checks,
+// import missing packs, and update refs.
 func (e *Engine) Fetch() error {
+	if err := e.refreshPackKeys(); err != nil {
+		return err
+	}
+	trusted, _, err := e.loadTrustedRoster()
+	if err != nil {
+		return err
+	}
+
 	blob, version, err := e.store.GetManifest()
 	if err != nil {
 		return err
@@ -312,18 +415,17 @@ func (e *Engine) Fetch() error {
 	if err != nil {
 		return err
 	}
-	// Verify the signature (and signer) BEFORE trusting any contents (§5.3).
-	if err := e.verifyManifest(m); err != nil {
+	// Signer must be in the current roster, and the signature must verify (§4, §5.3).
+	if err := e.verifyManifestWithRoster(m, trusted); err != nil {
 		return err
 	}
 	newHash := util.SHA256Hex(plain)
 
-	// §5.7 rollback / equivocation detection.
-	st, exists, err := e.state.Load()
+	st, _, err := e.state.Load()
 	if err != nil {
 		return err
 	}
-	if exists {
+	if st.Version != 0 {
 		if m.Version <= st.Version {
 			return fmt.Errorf("helper: rollback detected: manifest version %d <= pinned %d", m.Version, st.Version)
 		}
@@ -332,7 +434,6 @@ func (e *Engine) Fetch() error {
 		}
 	}
 
-	// Import missing packs (verifying ciphertext hash == pack_id inside importPack).
 	for _, packID := range m.Packs {
 		if st.HasPack(packID) {
 			continue
@@ -342,8 +443,6 @@ func (e *Engine) Fetch() error {
 		}
 		st.AddPack(packID)
 	}
-
-	// Update local refs from the manifest (§5.5 step 4).
 	for ref, sha := range m.Refs {
 		if err := updateRef(e.gitDir, ref, sha); err != nil {
 			return err
@@ -375,7 +474,7 @@ func curPacks(c *current) []string {
 
 func prevHashPtr(c *current) *string {
 	if c.manifest == nil {
-		return nil // first manifest: prev_manifest_hash = null
+		return nil
 	}
 	h := c.hash
 	return &h
