@@ -28,12 +28,25 @@ type Store interface {
 	// HasBlob reports whether id is present.
 	HasBlob(id string) (bool, error)
 
+	// DeleteBlob removes a blob (used only by a full rekey, which drops the old
+	// pack blobs). Deleting an absent blob is not an error.
+	DeleteBlob(id string) error
+
 	// GetManifest returns the current manifest blob and its CAS version. When no
 	// manifest exists yet it returns (nil, 0, nil).
 	GetManifest() (blob []byte, version uint64, err error)
 	// CASManifest atomically swaps the manifest to (blob, newVersion) only if the
 	// currently stored version equals expectedVersion, else ErrVersionConflict.
 	CASManifest(expectedVersion uint64, blob []byte, newVersion uint64) error
+
+	// GetRoster returns the current roster blob and its CAS version (Tier 3). When
+	// no roster exists yet it returns (nil, 0, nil). Note: the genesis roster has
+	// version 0, so "no roster" is signalled by a nil blob, not by version==0.
+	GetRoster() (blob []byte, version uint64, err error)
+	// CASRoster atomically swaps the roster to (blob, newVersion) only if the
+	// currently stored version equals expectedVersion, else ErrVersionConflict.
+	// Genesis creation uses expectedVersion==0 with no roster present.
+	CASRoster(expectedVersion uint64, blob []byte, newVersion uint64) error
 
 	// PutKeyfile stores the keyfile blob (repo key wrapped to members, §3).
 	PutKeyfile(data []byte) error
