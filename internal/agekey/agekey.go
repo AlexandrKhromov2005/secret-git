@@ -36,6 +36,21 @@ func IdentityFromScalar(scalar [32]byte) (*age.X25519Identity, error) {
 	return id, nil
 }
 
+// RecipientFromPublic builds an *age.X25519Recipient from a raw 32-byte X25519
+// public key (used to wrap the repo key to roster members). It bech32-encodes the
+// key the way age's X25519Recipient.String() does and parses it back.
+func RecipientFromPublic(pub [32]byte) (*age.X25519Recipient, error) {
+	s, err := bech32.Encode("age", pub[:])
+	if err != nil {
+		return nil, fmt.Errorf("agekey: bech32 encode recipient: %w", err)
+	}
+	r, err := age.ParseX25519Recipient(s)
+	if err != nil {
+		return nil, fmt.Errorf("agekey: parse recipient: %w", err)
+	}
+	return r, nil
+}
+
 // PublicFromScalar returns the raw 32-byte X25519 public key for a scalar. This
 // equals the public key age derives for the same scalar (curve25519 clamps the
 // scalar internally), so it is consistent with IdentityFromScalar(...).Recipient().
