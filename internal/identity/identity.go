@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 
@@ -17,6 +18,13 @@ import (
 
 	"encgit/internal/agekey"
 )
+
+// ErrDegenerateSeed is returned by FromSeed when the seed is obviously non-random
+// (all 32 bytes identical, e.g. an all-zero / uninitialized seed). This is a guard
+// against a forgotten or zeroed seed; it does NOT and cannot measure the entropy of
+// a non-constant seed — full entropy is the caller's responsibility (use NewSeed /
+// crypto/rand). See §2 and FORMAT-NOTES.
+var ErrDegenerateSeed = errors.New("identity: degenerate seed (all bytes identical); seed must come from a CSPRNG")
 
 const (
 	// SeedLen is the size of a member seed in bytes (§2: 32 bytes from CSPRNG).
@@ -61,8 +69,23 @@ func hkdf32(ikm []byte, info string) ([32]byte, error) {
 	return out, nil
 }
 
-// FromSeed deterministically derives the full identity from a seed.
+// isDegenerateSeed reports whether every byte of the seed is identical (covers the
+// all-zero / uninitialized case and any constant-byte seed).
+func isDegenerateSeed(seed [32]byte) bool {
+	for _, b := range seed[1:] {
+		if b != seed[0] {
+			return false
+		}
+	}
+	return true
+}
+
+// FromSeed deterministically derives the full identity from a seed. It rejects an
+// obviously degenerate (constant-byte) seed; see ErrDegenerateSeed.
 func FromSeed(seed [32]byte) (*Identity, error) {
+	if isDegenerateSeed(seed) {
+		return nil, ErrDegenerateSeed
+	}
 	id := &Identity{seed: seed}
 
 	// X25519 (repo-key reception).
