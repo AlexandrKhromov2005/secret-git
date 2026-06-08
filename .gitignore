@@ -1,0 +1,14 @@
+# Claude Code / OMC local files — never commit
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.omc/
+
+# Build artifacts
+/encgit
+/dist/
+*.test
+*.out
+
+# Local scratch
+/tmp/
