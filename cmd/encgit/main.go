@@ -40,6 +40,12 @@ func main() {
 		err = cmdPush(os.Args[2:])
 	case "fetch":
 		err = cmdFetch(os.Args[2:])
+	case "member-add":
+		err = cmdMemberAdd(os.Args[2:])
+	case "member-remove":
+		err = cmdMemberRemove(os.Args[2:])
+	case "rekey":
+		err = cmdRekey(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -63,7 +69,96 @@ usage:
   encgit init           --store DIR --seed FILE
   encgit push           --store DIR --seed FILE --repo-id HEX [--git DIR] [--state FILE] [refs...]
   encgit fetch          --store DIR --seed FILE --repo-id HEX [--git DIR] [--state FILE]
+  encgit member-add     --store DIR --seed FILE --repo-id HEX --name NAME --x25519 HEX --ed25519 HEX --fingerprint HEX [--git DIR]
+  encgit member-remove  --store DIR --seed FILE --repo-id HEX --fingerprint HEX [--git DIR]
+  encgit rekey          --store DIR --seed FILE --repo-id HEX [--git DIR]
+
+member-add takes the new member's public keys and their OOB-verified fingerprint
+(from 'encgit identity show' on the new member's machine, confirmed out of band).
 `)
+}
+
+func parse32Hex(s string) ([32]byte, error) {
+	var out [32]byte
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return out, err
+	}
+	if len(b) != 32 {
+		return out, fmt.Errorf("expected 32 bytes (64 hex chars), got %d", len(b))
+	}
+	copy(out[:], b)
+	return out, nil
+}
+
+func cmdMemberAdd(args []string) error {
+	fs := flag.NewFlagSet("member-add", flag.ContinueOnError)
+	f := bindEngineFlags(fs)
+	name := fs.String("name", "", "human-readable name for the new member")
+	x25519 := fs.String("x25519", "", "new member's X25519 public key (hex raw32)")
+	ed25519Hex := fs.String("ed25519", "", "new member's Ed25519 public key (hex raw32)")
+	fingerprint := fs.String("fingerprint", "", "new member's OOB-verified fingerprint (hex)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *name == "" || *x25519 == "" || *ed25519Hex == "" || *fingerprint == "" {
+		return errors.New("member-add: --name, --x25519, --ed25519 and --fingerprint are required")
+	}
+	xpub, err := parse32Hex(*x25519)
+	if err != nil {
+		return fmt.Errorf("--x25519: %w", err)
+	}
+	edpub, err := parse32Hex(*ed25519Hex)
+	if err != nil {
+		return fmt.Errorf("--ed25519: %w", err)
+	}
+	eng, err := f.open()
+	if err != nil {
+		return err
+	}
+	if err := eng.AddMember(*name, xpub, edpub, *fingerprint); err != nil {
+		return err
+	}
+	fmt.Printf("added member %q\n", *name)
+	return nil
+}
+
+func cmdMemberRemove(args []string) error {
+	fs := flag.NewFlagSet("member-remove", flag.ContinueOnError)
+	f := bindEngineFlags(fs)
+	fingerprint := fs.String("fingerprint", "", "fingerprint of the member to remove (hex)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *fingerprint == "" {
+		return errors.New("member-remove: --fingerprint is required")
+	}
+	eng, err := f.open()
+	if err != nil {
+		return err
+	}
+	if err := eng.RemoveMember(*fingerprint); err != nil {
+		return err
+	}
+	fmt.Println("removed member; repo key rotated (run 'rekey' to re-encrypt history)")
+	return nil
+}
+
+func cmdRekey(args []string) error {
+	fs := flag.NewFlagSet("rekey", flag.ContinueOnError)
+	f := bindEngineFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	eng, err := f.open()
+	if err != nil {
+		return err
+	}
+	if err := eng.FullRekey(); err != nil {
+		return err
+	}
+	fmt.Println("full rekey complete; history re-encrypted under a new repo key")
+	return nil
 }
 
 // --- seed file I/O (64 hex chars, 0600) ---
@@ -137,6 +232,7 @@ func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	storeDir := fs.String("store", "", "path to the (local stub) store directory")
 	seedPath := fs.String("seed", "", "path to the member seed file")
+	name := fs.String("name", "founder", "human-readable name for the founding member")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -151,7 +247,7 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	repoID, err := helper.Init(st, id)
+	repoID, err := helper.Init(st, id, *name)
 	if err != nil {
 		return err
 	}
