@@ -122,8 +122,8 @@ func TestJCS_RejectsOutOfDomain(t *testing.T) {
 		int(5),
 		int64(7),
 		json.Number("1.5"),
-		[]any{"a", "b"},
 		[]int{1, 2},
+		[]any{"ok", float64(1)}, // an array element out of domain
 		map[string]any{"x": float64(2)},
 		map[string]any{"y": true},
 		map[string]int{"z": 1},
@@ -132,6 +132,14 @@ func TestJCS_RejectsOutOfDomain(t *testing.T) {
 		if _, err := canonicalJSON(v); err == nil {
 			t.Errorf("case %d (%T): expected an error, got none", i, v)
 		}
+	}
+
+	// In-domain []any (arrays of strings / objects, used by the roster) is accepted.
+	if _, err := canonicalJSON([]any{"a", "b"}); err != nil {
+		t.Errorf("[]any of strings: unexpected error: %v", err)
+	}
+	if _, err := canonicalJSON([]any{map[string]string{"k": "v"}}); err != nil {
+		t.Errorf("[]any of objects: unexpected error: %v", err)
 	}
 
 	// Reference documents containing floats / heterogeneous arrays must also error.

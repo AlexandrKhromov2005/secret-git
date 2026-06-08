@@ -9,9 +9,12 @@ import (
 )
 
 // canonicalJSON implements the subset of RFC 8785 (JSON Canonicalization Scheme)
-// needed for the manifest. The manifest value space is restricted to strings,
-// uint64, null, string->string maps, and string arrays — there are no floats — so
-// the difficult part of JCS (ECMAScript number serialization) never arises.
+// needed for the manifest and (Tier 3) the roster. The value space is restricted to
+// strings, uint64, null, string->string maps, objects (map[string]any), and arrays
+// of those (string arrays and []any) — there are no floats — so the difficult part
+// of JCS (ECMAScript number serialization) never arises. Arrays of objects ([]any
+// of maps) are used by the roster's "members" list; manifests never use []any, so
+// manifest output is byte-identical to v1.
 //
 // SECURITY-REVIEW (§7.4): determinism of this encoder. Object members are sorted
 // by UTF-16 code-unit order; integers are plain decimal; strings are escaped per
@@ -24,6 +27,11 @@ func canonicalJSON(v any) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+// CanonicalJSON is the exported entry point so other format packages (e.g. the
+// roster) can reuse the exact, externally-validated JCS encoder rather than
+// re-implementing canonicalization.
+func CanonicalJSON(v any) ([]byte, error) { return canonicalJSON(v) }
 
 func encodeValue(buf *bytes.Buffer, v any) error {
 	switch x := v.(type) {
@@ -40,6 +48,17 @@ func encodeValue(buf *bytes.Buffer, v any) error {
 				buf.WriteByte(',')
 			}
 			encodeString(buf, s)
+		}
+		buf.WriteByte(']')
+	case []any:
+		buf.WriteByte('[')
+		for i, e := range x {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := encodeValue(buf, e); err != nil {
+				return err
+			}
 		}
 		buf.WriteByte(']')
 	case map[string]string:
