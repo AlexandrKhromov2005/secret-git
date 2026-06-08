@@ -31,14 +31,32 @@ stay consistent. Nothing here overrides the frozen format; it pins the gaps.
 
 ## HKDF (golang.org/x/crypto/hkdf, SHA-256)
 
-- `salt=""` is implemented as an empty/nil salt, which Go's HKDF expands to a block of
-  `hashLen` zero bytes — the HKDF-with-no-salt default. // SECURITY-REVIEW lives at each call site.
-- Exact `info` strings, byte-for-byte:
+- The derivations use **full HKDF (RFC 5869): extract + expand**, via `hkdf.New(sha256.New, ikm,
+  salt, info)` — not expand-only. The `extract` step runs `HMAC-SHA256(salt, ikm)` to produce the
+  PRK, then `expand` produces the output keying material.
+- `salt=""` is implemented as an empty/nil salt, which Go's HKDF (per RFC 5869) substitutes with a
+  block of `hashLen` zero bytes for the extract HMAC key — the HKDF-with-no-salt default.
+  // SECURITY-REVIEW lives at each call site.
+- Exact `info` strings, byte-for-byte (also asserted equal to `docs/FORMAT-SPEC.md` by tests):
   - member X25519: `encgit/member-x25519/v1`
   - member Ed25519: `encgit/member-ed25519/v1` (then `ed25519.NewKeyFromSeed`)
   - pack/manifest recipient: `encgit/pack-recipient/v1` ++ raw `repo_id` bytes
 - `seed -> X25519` and `seed -> Ed25519` use distinct `info` labels, so the two key materials
   are independent (no dual-use).
+- **Cross-checked externally:** `internal/identity` re-derives the member keys with an independent
+  from-scratch RFC 5869 HKDF (HMAC-extract + HMAC-expand) and confirms the result matches — proving
+  the extract+expand semantics and the `salt=""` zero-key behavior, not just self-consistency.
+
+## Entropy invariant (§2)
+
+- Member-key uniqueness rests entirely on the seed being **full-entropy 32 bytes from
+  `crypto/rand`** (`identity.NewSeed`). Distinct members ⇒ distinct seeds ⇒ distinct keys is only
+  guaranteed because the seed space (2^256) makes collisions negligible; there is no other
+  uniqueness mechanism.
+- `identity.FromSeed` rejects an obviously **degenerate seed** (all 32 bytes identical — covers the
+  all-zero / uninitialized case) with `ErrDegenerateSeed`. This is a guard against a forgotten or
+  zeroed seed; it deliberately does **not** attempt to measure the entropy of a non-constant seed
+  (impossible in general) — supplying a high-entropy seed remains the caller's responsibility.
 
 ## age usage
 
@@ -54,6 +72,10 @@ stay consistent. Nothing here overrides the frozen format; it pins the gaps.
 - The age recipient for a scalar is `identity.Recipient()`. Raw X25519 public bytes (needed for
   the fingerprint and as the keyfile recipient) are computed with
   `curve25519.X25519(scalar, curve25519.Basepoint)`, which equals age's own recipient public key.
+- **Cross-checked externally (§7.1):** `internal/agekey` confirms the derived public key against the
+  implementation-independent **RFC 7748 §6.1 known-answer vectors** and against `crypto/ecdh` (a
+  different X25519 implementation), and confirms the age recipient string carries exactly that
+  public key. This rules out a "consistently wrong" clamping that a round-trip alone would miss.
 
 ## Canonical JSON (RFC 8785 JCS)
 
@@ -69,6 +91,14 @@ stay consistent. Nothing here overrides the frozen format; it pins the gaps.
   other control chars `< U+0020` use lowercase `\u00xx`; every other code point is emitted
   literally as UTF-8. Arrays preserve order (JCS does not sort arrays); integers via
   `strconv.FormatUint`.
+- **Validated against external vectors, not self-tuned expectations:** the encoder is checked
+  byte-for-byte against the RFC 8785 reference test vectors from the `json-canonicalization`
+  project (`internal/manifest/testdata/jcs/`, Apache-2.0) and the RFC 8785 §3.2.2.2 escape table —
+  covering UTF-16 code-unit key sorting including a surrogate-pair (astral) key, the short escapes
+  vs `\u00xx`, and literal non-ASCII. Out-of-domain inputs (floats, booleans, signed ints,
+  heterogeneous arrays) must make the encoder **fail explicitly** rather than emit wrong bytes;
+  this is tested too. If any external vector ever fails to match, the format is non-conformant —
+  the response is to STOP and report, never to change the encoder.
 
 ## Manifest hashing & the prev/pin chain
 
