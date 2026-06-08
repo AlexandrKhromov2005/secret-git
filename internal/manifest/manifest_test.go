@@ -19,17 +19,24 @@ func sampleManifest() *Manifest {
 		Refs:             map[string]string{"refs/heads/main": "aaa", "refs/heads/feature": "bbb"},
 		Packs:            []string{"p1", "p2"},
 		PusherKeyID:      "ffff",
+		RosterHash:       "cafe",
 		Sig:              "U0lH",
 	}
 }
 
+// readSpec concatenates the v1 and Tier-3(v2) frozen spec docs, since v2 fields
+// (roster_hash) are documented in the Tier-3 spec.
 func readSpec(t *testing.T) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "FORMAT-SPEC.md"))
-	if err != nil {
-		t.Fatal(err)
+	var all string
+	for _, name := range []string{"FORMAT-SPEC.md", "FORMAT-SPEC-TIER3.md"} {
+		b, err := os.ReadFile(filepath.Join("..", "..", "docs", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		all += string(b)
 	}
-	return string(b)
+	return all
 }
 
 // TestManifestSchemaFieldsMatchSpec pins the §5.2 manifest field names against the
@@ -48,7 +55,7 @@ func TestManifestSchemaFieldsMatchSpec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fields := []string{"repo_id", "version", "prev_manifest_hash", "refs", "packs", "pusher_key_id", "sig"}
+	fields := []string{"repo_id", "version", "prev_manifest_hash", "refs", "packs", "pusher_key_id", "roster_hash", "sig"}
 	for _, f := range fields {
 		if !strings.Contains(spec, `"`+f+`"`) {
 			t.Errorf("field %q is not documented in docs/FORMAT-SPEC.md", f)

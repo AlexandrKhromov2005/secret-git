@@ -98,20 +98,32 @@ func TestKeyfileWrapUnwrap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	keyfile, err := WrapRepoKey(repoKey, idA.Recipient())
+	const generation = 7
+	keyfile, err := WrapRepoKey(generation, repoKey, idA.Recipient())
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := UnwrapRepoKey(keyfile, idA)
+	gotGen, got, err := UnwrapRepoKey(keyfile, idA)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if gotGen != generation {
+		t.Fatalf("generation = %d, want %d", gotGen, generation)
 	}
 	if !bytes.Equal(got, repoKey) {
 		t.Fatal("unwrapped repo key mismatch")
 	}
 
 	// A non-recipient member cannot unwrap.
-	if _, err := UnwrapRepoKey(keyfile, idB); err == nil {
+	if _, _, err := UnwrapRepoKey(keyfile, idB); err == nil {
 		t.Fatal("non-recipient unwrapped the keyfile")
+	}
+
+	// The AEAD protects the generation||key payload: flipping a ciphertext byte
+	// makes decryption fail rather than silently changing the generation.
+	bad := append([]byte(nil), keyfile...)
+	bad[len(bad)/2] ^= 0xff
+	if _, _, err := UnwrapRepoKey(bad, idA); err == nil {
+		t.Fatal("tampered keyfile unwrapped without error")
 	}
 }

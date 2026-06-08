@@ -52,6 +52,7 @@ func TestSignedFieldsCoverage(t *testing.T) {
 		{"packs entry", func(m *Manifest) { m.Packs[0] = "pX" }},
 		{"packs append", func(m *Manifest) { m.Packs = append(m.Packs, "pZ") }},
 		{"pusher_key_id", func(m *Manifest) { m.PusherKeyID = "0000" }},
+		{"roster_hash", func(m *Manifest) { m.RosterHash = "beef" }},
 	}
 	for _, mc := range mutations {
 		m := cloneManifest(base)

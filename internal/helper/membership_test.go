@@ -227,6 +227,9 @@ func TestRemoveEnforcesBothGates(t *testing.T) {
 		Refs:        map[string]string{"refs/heads/main": "deadbeef"},
 		Packs:       []string{},
 		PusherKeyID: m1.FingerprintHex(),
+		// Correct roster_hash so the manifest passes m1's binding check and the
+		// rejection is specifically the removed signer not being in the roster.
+		RosterHash: currentRosterHash(t, st, m0, repoID),
 	}
 	installSignedManifest(t, st, pkNew, m1, forged, nil)
 

@@ -108,7 +108,7 @@ func derivePackKeys(t *testing.T, st store.Store, member *identity.Identity, rep
 	if err != nil {
 		t.Fatal(err)
 	}
-	repoKey, err := crypto.UnwrapRepoKey(keyfile, member.AgeIdentity())
+	_, repoKey, err := crypto.UnwrapRepoKey(keyfile, member.AgeIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,6 +121,22 @@ func derivePackKeys(t *testing.T, st store.Store, member *identity.Identity, rep
 		t.Fatal(err)
 	}
 	return pk
+}
+
+// currentRosterHash decrypts the current roster and returns its canonical hash,
+// for stamping forged manifests with a roster_hash the victim will accept.
+func currentRosterHash(t *testing.T, st store.Store, member *identity.Identity, repoID string) string {
+	t.Helper()
+	pk := derivePackKeys(t, st, member, repoID)
+	blob, _, err := st.GetRoster()
+	if err != nil || blob == nil {
+		t.Fatalf("no roster: %v", err)
+	}
+	plain, err := crypto.Decrypt(blob, pk.Identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return util.SHA256Hex(plain)
 }
 
 // installSignedManifest signs m with the given member, optionally corrupts it,
@@ -357,7 +373,8 @@ func TestEquivocationDetected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Forge a v2 whose prev_manifest_hash does NOT chain to the pinned v1.
+	// Forge a v2 whose prev_manifest_hash does NOT chain to the pinned v1 (roster_hash
+	// is correct so it passes m1 and reaches the §5.7 chain check).
 	wrongPrev := strings.Repeat("00", 32)
 	forged := &manifest.Manifest{
 		RepoID:           repoID,
@@ -366,6 +383,7 @@ func TestEquivocationDetected(t *testing.T) {
 		Refs:             map[string]string{"refs/heads/main": shaA},
 		Packs:            v1.Packs,
 		PusherKeyID:      member.FingerprintHex(),
+		RosterHash:       currentRosterHash(t, st, member, repoID),
 	}
 	installSignedManifest(t, st, pk, member, forged, nil)
 
@@ -406,7 +424,7 @@ func TestBadSignatureRejected(t *testing.T) {
 	v1, _ := manifest.Parse(v1plain)
 	h1 := util.SHA256Hex(v1plain)
 
-	// A properly-chained v2, but with a corrupted signature.
+	// A properly-chained v2 with correct roster_hash, but with a corrupted signature.
 	forged := &manifest.Manifest{
 		RepoID:           repoID,
 		Version:          2,
@@ -414,6 +432,7 @@ func TestBadSignatureRejected(t *testing.T) {
 		Refs:             map[string]string{"refs/heads/main": shaA},
 		Packs:            v1.Packs,
 		PusherKeyID:      member.FingerprintHex(),
+		RosterHash:       currentRosterHash(t, st, member, repoID),
 	}
 	installSignedManifest(t, st, pk, member, forged, func(m *manifest.Manifest) {
 		raw, err := base64.StdEncoding.DecodeString(m.Sig)

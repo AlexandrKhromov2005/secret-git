@@ -160,6 +160,29 @@ func TestRosterParseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRosterRepoKeyGenerationSigned(t *testing.T) {
+	m0, priv0 := makeMember(t, "alice", 1)
+	fp0, _ := m0.Fingerprint()
+	r := &Roster{RepoID: "r", Version: 2, Members: []Member{m0}, AuthorKeyID: fp0, RepoKeyGeneration: 3}
+	if err := r.Sign(priv0); err != nil {
+		t.Fatal(err)
+	}
+	canon, err := r.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(canon, []byte(`"repo_key_generation":3`)) {
+		t.Fatalf("repo_key_generation not in canonical bytes: %s", canon)
+	}
+	pub0, _ := m0.EdPub()
+	// Tampering with the generation invalidates the signature.
+	r2 := *r
+	r2.RepoKeyGeneration = 4
+	if err := r2.Verify(pub0); err == nil {
+		t.Fatal("repo_key_generation change was not detected by the signature")
+	}
+}
+
 func TestRosterGenesisPrevNull(t *testing.T) {
 	m0, priv0 := makeMember(t, "alice", 1)
 	fp0, _ := m0.Fingerprint()
