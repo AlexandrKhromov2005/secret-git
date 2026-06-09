@@ -185,10 +185,14 @@ Bringing up a server-backed repo from scratch is a short sequence, not one comma
    the founder `fingerprint`.
 2. **Founder → admin, out of band:** hand over `repo_id` (and the `fingerprint`, for the same roster
    fingerprint-verification members already do at add time).
-3. **Admin, on the server:** `POST /repos {repo_id}` with that exact `repo_id` (the server stores the id
-   it is given; it does not generate one), then grant the founder writer — either `POST /repos {repo_id,
-   founder_username}` if the account exists, or issue a writer invite the founder redeems at
-   `POST /auth/register`.
+3. **Admin, on the server:** `POST /repos {repo_id}` with that exact `repo_id` (the server stores the id it
+   is given; it does not generate one), then grant the founder writer. **Recommended — the invite path:**
+   issue a writer invite and have the founder redeem it at `POST /auth/register`, which atomically creates
+   the account bound to this `repo_id`+writer (an atomic single-use+binding, validated in the hardening
+   pass). **Alternative — grant by username:** `POST /repos {repo_id, founder_username}`, but the founder's
+   account MUST already exist before this grant — otherwise the server returns an error, because the username
+   grant binds an existing account and cannot create one. (This ordering pitfall is why the invite path is
+   recommended.)
 4. **Founder:** `encgit login --seed FILE URL founder` (saves the API token next to the seed), then
    **`encgit publish-genesis --store URL --repo-id HEX --from <dir> --seed FILE`** — this uploads the
    already-signed genesis (keyfile + genesis roster) from the local `<dir>` to the server over the same

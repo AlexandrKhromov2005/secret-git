@@ -104,9 +104,11 @@ encgit init --store ./initstore --seed founder.seed
 
 # 2. founder -> admin, OUT OF BAND: hand over repo_id (and fingerprint).
 
-# 3. admin, on the server: create the repo with THAT repo_id and grant the founder writer
-#    (POST /repos {repo_id} then a writer invite the founder redeems at POST /auth/register,
-#    or POST /repos {repo_id, founder_username} if the account already exists).
+# 3. admin, on the server: create the repo with THAT repo_id, then grant the founder writer.
+#    RECOMMENDED (invite path): POST /repos {repo_id}, then issue a writer invite; the founder
+#    redeems it at POST /auth/register, which atomically creates the account bound to repo_id+writer.
+#    ALTERNATIVE (grant by username): POST /repos {repo_id, founder_username} -- but the founder's
+#    account MUST already exist before this grant, or it fails.
 
 # 4. founder: log in, publish the genesis, then push:
 encgit login --seed founder.seed https://server.example founder
