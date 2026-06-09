@@ -284,3 +284,54 @@ defeats it.
   cleanly at the m2 check rather than as an opaque "cannot decrypt" error.
 - Manifest acceptance order is exactly rule D: advance roster pin → m2 (keyfile gen) → decrypt manifest
   → m1 (roster_hash) + signer ∈ roster → §5.7 chain.
+
+---
+
+## Tier 4 (HTTP server + auth) — see `docs/FORMAT-SPEC-TIER4.md`
+
+Decisions taken within the freedom of the Tier-4 brief; the v2 format and `store.Store` are untouched.
+
+### Confirmed with the spec owner (would otherwise be ambiguous vs committed code)
+- **Store selection** has no pre-existing convention (the CLI used `--store DIR` → `localfs.Open`). Rule:
+  the `--store` value is parsed; an `http`/`https` scheme → HTTP store, otherwise a localfs path. No
+  heuristics beyond the scheme; no new flag/syntax.
+- **Endpoint set:** ЧАСТЬ B listed only blobs+manifest, but the frozen `store.Store` also has roster (CAS),
+  keyfile (singleton), and DeleteBlob. Per the owner: mirror the patterns — roster GET/PUT with
+  ETag/If-Match (CAS, byte-for-byte the manifest semantics, 412 → the same conflict error so the helper's
+  rebase-retry is reused); keyfile GET/PUT singleton **without CAS** (adding CAS would change the frozen
+  interface); `DELETE /blobs/{hash}` writer-only (the accepted ЧАСТЬ A DoS risk, not a confidentiality
+  break). No GC policy that would trigger deletion is implemented (ЧАСТЬ F).
+
+### HTTP CAS realization
+- **Manifest** PUT uses `If-Match: "{expected}"`; the server sets `version = expected+1` (first manifest
+  is version 1). **Roster** PUT additionally carries `Encgit-New-Version: "{n}"`, because the roster
+  genesis is `0→0` (not `expected+1`) and both genesis-create and the first change use `If-Match: "0"`.
+  This mirrors `store.CASRoster(expected, blob, newVersion)` exactly. A missing roster reads as version 0
+  (the genesis-insert path), identical to localfs — so the genesis write path is NOT ambiguous and did not
+  need a separate decision.
+- Manifest/roster blobs are stored INLINE in `manifest_state`/`roster_state` rows so each CAS is a single
+  atomic SQL transaction. The brief's `blob_ref` is realized as that inline `blob` column, chosen for the
+  "one transaction" atomicity requirement. Packs and the keyfile are files on disk (packs by content hash,
+  hash-verified on PUT — content-addressing integrity, not content understanding).
+
+### Auth specifics
+- argon2id parameters: m=19456 KiB (19 MiB), t=2, p=1, salt 16 B, output 32 B; stored per-account as a
+  params string so cost can evolve without breaking existing hashes. // SECURITY-REVIEW (confirm params).
+- Bootstrap, invite, and API tokens are CSPRNG 256-bit base64url; only their SHA-256 is persisted; bearer
+  lookup is by hash with a constant-time compare and an expiry check (argon2id is computed only at login).
+- Bootstrap is minted only when there are no admins AND no live bootstrap row; single-use. Login returns
+  the same 401 for unknown user and wrong password (no user enumeration). Admin status grants NO data
+  access — data endpoints always require a repo-scoped role (orthogonality enforced at the API layer).
+- SQLite via `modernc.org/sqlite` (pure Go, no cgo); `SetMaxOpenConns(1)` serializes DB access for
+  deterministic CAS under concurrency (a memory/locking simplification, not a quota).
+
+### Scope boundary (flagged honestly)
+- The TLS terminator, GC, quotas, and rate-limiting are deferred (ЧАСТЬ F).
+- **Founder genesis provisioning over HTTP is not a one-shot CLI command.** `helper.Init` is frozen and
+  self-generates `repo_id`, while the HTTP store needs `repo_id` to route and the admin creates the repo
+  (with access control) before the founder writes — so a single `encgit init --store URL` cannot both
+  generate `repo_id` and write the genesis to a pre-authorized server repo. The operational flow is:
+  founder `encgit init` locally → reports `repo_id` to an admin → admin `POST /repos {repo_id,
+  founder_username}` (+ writer invite) → founder logs in and uploads the genesis keyfile+roster. The e2e
+  test does this upload inline; a dedicated provisioning command is the next increment (it would NOT touch
+  the frozen format or interface).
