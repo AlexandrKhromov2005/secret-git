@@ -359,8 +359,39 @@ invalidates live tokens. Deferred to the account-management increment. Acknowled
 not a confidentiality break (a token never yields decryption/forgery). Operational mitigation: short
 `TokenTTL`. Recorded in `docs/FORMAT-SPEC-TIER4.md` (ЧАСТЬ D + F).
 
+### Login rate limiting (/auth/login)
+Closes the unbounded-login DoS (19 MiB argon2id per attempt) + brute-force surface with two layers IN FRONT
+of argon2id; the cheap rejects (429/503) happen BEFORE argon2id — the load-bearing invariant.
+- **Persistent per-IP + per-username backoff** in SQLite (`login_throttle(scope,key,fail_count,window_until,
+  updated_at)`). Per attempt, in order: prune expired rows (self-cleaning; junk usernames can't grow the
+  table) → read ip+user windows, if either is open reject 429 + Retry-After WITHOUT argon2id → else verify →
+  on credential failure bump BOTH counters (`window_until = now + min(MAX, BASE·2^(n-1))`), on success reset
+  BOTH. Backoff is finite/capped (BASE=1s, MAX=60s) — never a hard lockout (lockout-by-username would itself
+  DoS the victim). Per-username is counted for ANY presented username, existing or not, applied identically
+  — so the throttle is NOT an existence oracle.
+- **In-process argon2id semaphore** (buffered channel, cap `MaxConcurrentArgon2`=4): try-acquire with
+  `Argon2AcquireTimeout`=2s, else 503 cheaply (no argon2id). Bounds peak login memory directly, independent
+  of attack keys. Wraps BOTH real verify and decoy (keeps anti-enum symmetry). Deliberately NOT in SQLite —
+  it's an instantaneous resource bond, orthogonal to the persistent count.
+- **Client IP (ЧАСТЬ C, confirmed with owner):** trust `ClientIPHeader` ONLY when host(`RemoteAddr`) ∈
+  `TrustedProxyCIDRs` (trust bound to the connection, not a flag); take the RIGHTMOST header token (proxy
+  appends/rewrites; left XFF tokens are client-controlled); parse via `netip`; any failure / no config →
+  fail closed to `RemoteAddr`. Server binary exposes `-trusted-proxy-cidrs` + `-client-ip-header`. HARD
+  deployment requirement documented: behind the mandatory proxy this MUST be configured or per-IP throttle
+  keys on the proxy (degradation, not a hole).
+- **Decoy-params invariant closed (ЧАСТЬ E):** argon2-params are process-global (only `hashPassword` writes
+  them, always the same constants); the decoy mirrors them. `TestDecoyArgonParamsMatchProduction` fails if
+  `hashPassword`'s emitted params/lengths ever drift from the decoy. If params become per-account/versioned,
+  the decoy MUST mirror the probed account's cost or enumeration reopens — same class of silent dependency as
+  the old pool-size one, now pinned by a test.
+- **Residual risk (documented, not fixed):** first attempt on a fresh key pays one argon2id; key rotation
+  gives one "free" argon2id per new key. Peak memory still bounded by the semaphore, per-account guessing
+  still bounded by backoff. Fully distributed (many-IP × many-user) attacks can cause work but not unbounded
+  memory or fast single-account guessing — an accepted MVP floor (CAPTCHA/PoW out of scope).
+
 ### Scope boundary (flagged honestly)
-- The TLS terminator, GC, quotas, and rate-limiting are deferred (ЧАСТЬ F).
+- The TLS terminator, GC, and quotas are deferred (ЧАСТЬ F). `/auth/login` rate-limiting is now implemented
+  (see above); account management / token revocation remain deferred.
 - **Founder genesis provisioning over HTTP is not a one-shot CLI command.** `helper.Init` is frozen and
   self-generates `repo_id`, while the HTTP store needs `repo_id` to route and the admin creates the repo
   (with access control) before the founder writes — so a single `encgit init --store URL` cannot both

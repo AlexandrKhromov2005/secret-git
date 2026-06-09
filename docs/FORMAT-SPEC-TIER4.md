@@ -23,6 +23,17 @@ TLS is mandatory in deployment: bearer tokens and passwords MUST NEVER travel in
 application intentionally does NOT terminate TLS — run it behind a TLS-terminating reverse proxy. The
 server listens on plain HTTP only.
 
+**Client-IP extraction behind the proxy (HARD, for the per-IP login throttle).** Because a reverse proxy
+is mandatory, `r.RemoteAddr` is the proxy's address, not the client's — so by default the per-IP login
+throttle (§H) keys on the proxy and collapses to a single global counter. To make per-IP throttling
+effective the operator MUST configure trusted client-IP extraction: set `-trusted-proxy-cidrs` to the
+proxy's source CIDR(s) and `-client-ip-header` to the header the proxy sets (e.g. `X-Forwarded-For`). The
+proxy MUST **overwrite/append** that header itself (the rightmost token is trusted) and MUST NOT forward a
+client-supplied value as-is. The server trusts the header ONLY for connections whose source address is in
+the configured CIDRs (trust bound to the connection, not a flag); otherwise, or on any parse failure, it
+fails closed to `RemoteAddr`. Leaving this unconfigured is safe (no spoofable trust) but degrades per-IP
+throttling to the proxy address — it is a degradation, not a hole.
+
 ## C. HTTP API
 `repo_id` is in the path; all blob/manifest/roster/keyfile bodies are opaque `application/octet-stream`.
 Authentication: `Authorization: Bearer {token}` on every data and admin endpoint.
@@ -102,15 +113,17 @@ Authentication: `Authorization: Bearer {token}` on every data and admin endpoint
 
 ## E. Server storage
 - Metadata: SQLite via the pure-Go `modernc.org/sqlite` (no cgo). Tables: `accounts`, `repos`,
-  `repo_access`, `invites`, `api_tokens`, `bootstrap`, `manifest_state`, `roster_state`.
+  `repo_access`, `invites`, `api_tokens`, `bootstrap`, `manifest_state`, `roster_state`, `login_throttle`
+  (per-IP / per-username login backoff state; see §H).
 - Packs/blobs and the keyfile are files on disk under a per-repo directory (blobs by content hash).
 - Manifest and roster blobs live INLINE in their `*_state` rows so the CAS is a single atomic SQL
   transaction (`UPDATE ... SET version=?, blob=? WHERE repo_id=? AND version=?`; 0 rows affected → 412).
 
 ## F. Out of scope (next increment; ЧАСТЬ F)
-GC of orphaned packs; quotas; rate-limiting; account management beyond creation (including account
-disablement and API-token revocation — see the "no token revocation" limitation in ЧАСТЬ D); in-app TLS
-termination.
+GC of orphaned packs; quotas; account management beyond creation (including account disablement and
+API-token revocation — see the "no token revocation" limitation in ЧАСТЬ D); in-app TLS termination;
+CAPTCHA; defense against a fully distributed (many-IP × many-username) login attack beyond §H.
+(`/auth/login` rate-limiting itself is now implemented — see §H.)
 Also out of scope (forced by the frozen `helper.Init`, which self-generates `repo_id`, and the
 minimal-client constraint): a one-shot CLI command for a founder to provision a repo's genesis over HTTP.
 The genesis flow is: founder runs `encgit init` locally → reports `repo_id` to an admin → admin
@@ -123,3 +136,44 @@ keyfile+roster. The e2e test performs this upload directly; a dedicated provisio
 - `encgit login --seed FILE URL USERNAME` prompts for the password (no echo), `POST /auth/login`, and
   saves the API token in a `0600` JSON file (`URL → token`) next to the seed. `push`/`fetch` then send it
   as `Authorization: Bearer`.
+
+## H. /auth/login rate limiting
+Unbounded `/auth/login` is a memory-amplification DoS (argon2id is 19 MiB per attempt) and a
+password-guessing surface. Two complementary mechanisms sit IN FRONT of argon2id; the cheap rejections
+(429, 503) MUST happen BEFORE any argon2id — that is the load-bearing invariant.
+
+**1. Persistent per-IP + per-username exponential backoff (SQLite `login_throttle`).** Two independent
+failure counters: per-IP (coarse source throttle) and per-username (protects a specific account from
+guessing). On each attempt, in strict order: (a) prune rows whose window expired more than a grace ago
+(self-cleaning, so junk usernames cannot grow the table); (b) read the `('ip',ip)` and `('user',user)`
+rows — if EITHER `window_until > now`, reject **429** with `Retry-After`, **without** argon2id; (c)
+otherwise run the verify; (d) on credential failure bump BOTH counters (`fail_count++`,
+`window_until = now + backoff(fail_count)`); on success reset BOTH. Backoff is
+`min(MAX_BACKOFF, BASE·2^(n-1))` — **always finite and capped (defaults BASE=1s, MAX_BACKOFF=60s)**, never
+a hard lockout (a lockout keyed by an attacker-chosen username would itself be a DoS on the victim). The
+per-username counter is kept for ANY presented username — existing or not — and applied identically, so
+throttling never becomes an account-existence oracle. `// SECURITY-REVIEW`.
+
+**2. In-process limiter on concurrent argon2id (peak-memory ceiling).** A counting semaphore bounds
+simultaneous argon2id to `MAX_CONCURRENT_ARGON2` (default 4 ≈ 4×19 MiB). Acquisition is a try-with-timeout
+(`ACQUIRE_TIMEOUT`, default 2s); on timeout the request gets **503** cheaply, **without** argon2id (so a
+flood cannot pile up waiting goroutines). The slot wraps BOTH the real verify and the anti-enumeration
+decoy, preserving equal-work symmetry. This is an in-process resource bond, deliberately NOT in SQLite
+(that is the separate persistent-count mechanism). `// SECURITY-REVIEW`.
+
+**Client-IP key:** see §B — the per-IP key uses the trusted proxy header only from a trusted source CIDR
+(rightmost token), else `RemoteAddr` (fail closed).
+
+**Anti-enumeration decoy invariant (now explicit).** The decoy defeats timing-based enumeration only if its
+argon2id cost equals a real verify's. argon2-params are process-global today (every `hashPassword` uses the
+same constants), and the decoy mirrors them. A guard test (`TestDecoyArgonParamsMatchProduction`) fails if
+the params/lengths `hashPassword` emits ever drift from the decoy. **If params ever become per-account or
+versioned, the login decoy MUST mirror the probed account's cost**, or timing diverges and enumeration
+reopens. `// SECURITY-REVIEW`.
+
+**Residual risk (acknowledged MVP floor, not fixed here).** The FIRST attempt on a *fresh* key pays one
+argon2id (no window yet); rotating keys yields one "free" argon2id per new key. Peak memory is still bounded
+by the semaphore, and guessing a specific account is still bounded by the per-username backoff. A fully
+distributed attack (many IPs × many usernames) can therefore cause argon2id work, but not unbounded memory
+and not fast guessing of any one account. CAPTCHA / global-rate / proof-of-work defenses against that are
+out of scope (§F).
