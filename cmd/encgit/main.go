@@ -40,6 +40,8 @@ func main() {
 		err = cmdPush(os.Args[2:])
 	case "fetch":
 		err = cmdFetch(os.Args[2:])
+	case "login":
+		err = cmdLogin(os.Args[2:])
 	case "member-add":
 		err = cmdMemberAdd(os.Args[2:])
 	case "member-remove":
@@ -72,9 +74,12 @@ usage:
   encgit member-add     --store DIR --seed FILE --repo-id HEX --name NAME --x25519 HEX --ed25519 HEX --fingerprint HEX [--git DIR]
   encgit member-remove  --store DIR --seed FILE --repo-id HEX --fingerprint HEX [--git DIR]
   encgit rekey          --store DIR --seed FILE --repo-id HEX [--git DIR]
+  encgit login          --seed FILE URL USERNAME
 
-member-add takes the new member's public keys and their OOB-verified fingerprint
-(from 'encgit identity show' on the new member's machine, confirmed out of band).
+--store accepts a localfs directory OR an http(s):// server URL (Tier 4). For a URL,
+run 'encgit login --seed FILE URL USERNAME' first to obtain an API token (stored next
+to the seed). member-add takes the new member's public keys and OOB-verified
+fingerprint (from 'encgit identity show', confirmed out of band).
 `)
 }
 
@@ -279,7 +284,7 @@ func (f *engineFlags) open() (*helper.Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := localfs.Open(f.storeDir)
+	st, err := openStore(f.storeDir, f.repoID, f.seedPath)
 	if err != nil {
 		return nil, err
 	}
