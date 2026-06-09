@@ -8,6 +8,55 @@
 > recorded separately in `../FORMAT-NOTES.md`.
 
 ================================================================================
+FORMAT VERSION 2 — DELTA (frozen; closes the cross-roster splice)
+================================================================================
+> v2 is the only format. The product is pre-release: v2 fully replaces v1; pre-v2 objects are
+> NOT read or migrated. v2 adds EXACTLY the two bindings below to the frozen v1/Tier-3 format and
+> nothing else. Roster fields/operations live in `FORMAT-SPEC-TIER3.md` (kept in sync).
+
+## m1 — `roster_hash` in the signed manifest
+- The manifest gains a field `roster_hash` (hex SHA-256). It is part of the JCS-canonical bytes that
+  are Ed25519-signed (sign-then-encrypt order unchanged: compute roster_hash → put in payload → sign →
+  encrypt). It is added to §5.2 below.
+- **Preimage:** `roster_hash = SHA-256( JCS( roster's SIGNED part ) )` — i.e. SHA-256 over EXACTLY the
+  JCS bytes the roster signature is computed over (the signed part, WITHOUT the roster's own `sig`
+  field). This is DELIBERATELY a different preimage from `prev_roster_hash` / the roster pin, which
+  stay defined as "SHA-256 of the canonical PLAINTEXT (with sig)" — those are unchanged.
+  // SECURITY-REVIEW: roster_hash preimage = SHA-256(JCS(roster signed-part, no sig)).
+- **On fetch:** after decrypting + verifying the manifest signature (signer ∈ trusted roster),
+  recompute the binding hash of the OOB-anchored / chain-verified trusted roster and require equality
+  with `manifest.roster_hash`. Mismatch → REJECT as cross-roster splice (error, no fallback).
+
+## m2 — `repo_key_generation` (monotonic repo-key generation counter)
+- A monotonic `uint64`. **Genesis roster: `repo_key_generation = 1`** (not 0 — so a missing/zero field
+  can never pass as a valid generation). // SECURITY-REVIEW: start value = 1.
+- Stored in two places: (1) inside the SIGNED part of the roster (authenticated by the roster
+  signature); (2) inside the age-AEAD-protected keyfile payload (plaintext `uint64-BE(generation) ||
+  repo_key_32`, integrity-protected by age after a legitimate recipient decrypts).
+  // SECURITY-REVIEW: repo_key_generation inside the signed roster AND inside the age keyfile payload.
+- **On fetch:** after decrypting the keyfile (→ repo key + generation) and validating the roster (→ its
+  claimed generation), require `keyfile.repo_key_generation == roster.repo_key_generation`. Mismatch →
+  REJECT as a key-generation downgrade/splice.
+- Two DIFFERENT counters, do not confuse: the roster `version` / chain (`prev_roster_hash`) grows on ANY
+  membership change; `repo_key_generation` grows ONLY on a repo-key rotation, i.e. only on member REMOVAL
+  (and full rekey).
+
+## Composition operations (frozen protocol behavior, not just notes)
+- ADD member: NO rotation. `repo_key_generation` unchanged; roster `version` grows; keyfile re-wrapped to
+  the larger recipient set with the same generation; the manifest is re-issued with the new `roster_hash`.
+- REMOVE member: ROTATION. `repo_key_generation += 1`; fresh repo key; keyfile re-wrapped to the remaining
+  recipients with the NEW generation; roster re-signed with the new generation; the manifest is re-issued
+  under the NEW key with the new `roster_hash`.
+
+## Fetch check order (single, explicit)
+1. Decrypt + verify the manifest Ed25519 signature; the signer MUST be a member of the trusted roster.
+2. `manifest.roster_hash == binding-hash(trusted roster)`.            (m1)
+3. Decrypt the keyfile (age, own derived X25519) → repo key + generation.
+4. `keyfile.repo_key_generation == roster.repo_key_generation`.       (m2)
+5. Existing §5.7 checks: version monotonicity, prev_manifest_hash chain integrity.
+Any of 1–5 failing → REJECT with a clear error, no silent fallback.
+
+================================================================================
 ЧАСТЬ 1. ЗАМОРОЖЕННЫЙ ФОРМАТ v1 (Tier 1 + Tier 2) — это контракт, соблюдай точно
 ================================================================================
 
@@ -69,8 +118,11 @@
   "refs":               { "refs/heads/main": "<git-object-sha-hex>", ... },
   "packs":              [ "<pack_id-hex>", ... ],  // упорядоченный список ЖИВЫХ паков для текущих refs
   "pusher_key_id":      "<fingerprint-hex>",       // кто из участников подписал
+  "roster_hash":        "<hex>",                   // v2/m1: SHA-256(JCS(подписанная часть ростера, без sig))
   "sig":                "<base64 Ed25519>"
 }
+// v2: roster_hash входит в подписанные байты (JCS до подписи), наравне со всеми полями кроме sig.
+// Канонический порядок ключей сохраняется (поле аддитивно): ..., repo_id, roster_hash, sig, version.
 ### 5.3 Подпись (sign-then-encrypt)
 1. Собрать объект манифеста БЕЗ поля sig, закодировать JCS -> signed_bytes.
 2. sig = Ed25519_sign(member_ed25519_priv, signed_bytes).

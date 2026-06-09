@@ -13,14 +13,19 @@ removed member's manifest against a lagging client by mixing the three independe
 pointers (roster, keyfile, manifest). v2 binds them. **There is no backward compatibility**:
 pre-v2 repositories are re-initialized.
 
-- **Manifest v2 — new signed field `"roster_hash"`** (hex): SHA-256 of the canonical PLAINTEXT of
-  the roster the manifest was produced under (the same value as that roster's `prev_roster_hash`
-  successor / pin). It is part of the signed JCS bytes (alongside all fields except `sig`); the
-  canonical-key order places it between `repo_id` and `sig`. sign-then-encrypt and JCS are unchanged.
+- **Manifest v2 — new signed field `"roster_hash"`** (hex): `SHA-256( JCS( roster's SIGNED part ) )`,
+  i.e. SHA-256 over EXACTLY the JCS bytes the roster signature is computed over (the signed part,
+  WITHOUT the roster's own `sig` field). This is DELIBERATELY a different preimage from
+  `prev_roster_hash` / the roster pin (which stay "SHA-256 of canonical PLAINTEXT *with* sig",
+  unchanged) — so the roster has two hashes: the with-sig one chains/pins it, the without-sig
+  "binding" one binds the manifest to it. roster_hash is part of the signed JCS bytes (alongside all
+  fields except `sig`); the canonical-key order places it between `repo_id` and `sig`. sign-then-encrypt
+  and JCS are unchanged. // SECURITY-REVIEW (m1): preimage = SHA-256(JCS(roster signed-part, no sig)).
 - **Roster v2 — new signed field `"repo_key_generation"`** (`uint64`): the generation of the repo
-  key. Genesis (roster v0) = 0; incremented **only** on a repo-key rotation (remove with minimal
-  rotation; full rekey). It does **not** change on add or on ordinary pushes. (The roster `version`
-  is its own membership-change counter, separate from `repo_key_generation`.)
+  key. **Genesis (roster v0) = 1** (not 0 — so a missing/zero field can never pass as a valid
+  generation); incremented **only** on a repo-key rotation (remove with minimal rotation; full rekey).
+  It does **not** change on add or on ordinary pushes. (The roster `version` is its own
+  membership-change counter, separate from `repo_key_generation`.) // SECURITY-REVIEW (m2): start = 1.
 - **Keyfile v2 — generation inside the AEAD payload**: the keyfile plaintext is now
   `uint64-BE(repo_key_generation) ‖ repo_key_32` (40 bytes), then `age.Encrypt(...)`. The age-AEAD
   protects the generation so the server cannot re-stamp it. This is a fixed binary layout, not a
@@ -34,8 +39,9 @@ pre-v2 repositories are re-initialized.
    (downgrade) → REJECT. Only on a match is the unwrapped repo key used as current.
 3. **Decrypt the manifest** under the current repo key and verify the signature with the member whose
    fingerprint == `pusher_key_id`. `// SECURITY-REVIEW (m1)`: the manifest's `roster_hash` MUST equal
-   the hash of the current trusted roster (step 1), AND the signer MUST be a member of it, else
-   REJECT. Then check the `version`/`prev_manifest_hash` chain (§5.7 v1).
+   the BINDING hash of the current trusted roster (step 1) — SHA-256 over the roster's signed bytes,
+   WITHOUT sig — AND the signer MUST be a member of it, else REJECT. Then check the
+   `version`/`prev_manifest_hash` chain (§5.7 v1).
 
 ### Consequence E — re-issue the manifest on every roster change
 Because the manifest is bound to the CURRENT roster, any membership change MUST re-issue the current

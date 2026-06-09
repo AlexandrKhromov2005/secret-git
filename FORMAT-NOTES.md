@@ -269,9 +269,16 @@ defeats it.
 - **Keyfile generation** lives only inside the AEAD payload; the store never sees it (fixed 40-byte
   binary layout, not a custom AEAD). `UnwrapRepoKey` returns `(generation, repo_key)` and rejects any
   payload that is not exactly 40 bytes.
-- **`repo_key_generation` semantics**: genesis 0; +1 on remove (minimal rotation) and full rekey;
-  unchanged on add and on ordinary pushes. The roster `version` (membership-change counter) is
-  independent of it.
+- **`repo_key_generation` semantics**: **genesis = 1** (not 0 — so a missing/zero field can never pass
+  as a valid generation; `checkKeyfileGeneration` also rejects generation 0 outright); +1 on remove
+  (minimal rotation) and full rekey; unchanged on add and on ordinary pushes. The roster `version`
+  (membership-change counter) is independent of it.
+- **`roster_hash` preimage (m1)** = `SHA-256( JCS( roster's signed part, WITHOUT sig ) )` —
+  `roster.BindingHash()`. This is DELIBERATELY distinct from `roster.Hash()` (SHA-256 of the canonical
+  plaintext WITH sig), which `prev_roster_hash` and the local pin keep using (frozen Tier-3 convention,
+  unchanged). So the roster carries two hashes: the with-sig one chains/pins it; the without-sig
+  binding one is what `manifest.roster_hash` stores and the fetch check recomputes. Confirmed with the
+  spec owner: "brief literal — manifest.roster_hash without-sig; leave prev_roster_hash with-sig."
 - **Roster decryption uses the multi-key cache** (not just the keyfile's key), so a downgraded keyfile
   cannot hide the real current-generation roster from a continuing member — the mismatch then surfaces
   cleanly at the m2 check rather than as an opaque "cannot decrypt" error.
