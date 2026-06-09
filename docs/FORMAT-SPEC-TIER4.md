@@ -84,6 +84,21 @@ Authentication: `Authorization: Bearer {token}` on every data and admin endpoint
   - `admin` → instance-level only (create repo, create invites). **Admin grants NO automatic data
     access**: an admin still needs a repo-scoped role to touch repo data (orthogonality at the API layer
     too).
+- **Atomic single-use (consume race).** Bootstrap and invite redemption claim the token with a single
+  guarded `UPDATE ... SET used=1 WHERE token_hash=? AND used=0 [AND expiry>?]` and require exactly one
+  affected row, inside the same transaction that creates the account. Two concurrent redemptions of one
+  token therefore yield exactly one account (no two-admins / invite-reuse race), independent of the DB
+  connection-pool size. Used / expired / unknown collapse to one generic rejection (no oracle).
+  // SECURITY-REVIEW.
+- **No login user-enumeration.** `POST /auth/login` returns an identical `401 invalid credentials` for an
+  unknown username and a wrong password, and runs an equivalent-cost argon2id pass in BOTH branches (a
+  decoy hash when the username is unknown) so response timing does not reveal account existence.
+  // SECURITY-REVIEW.
+- **Known limitation (v1): no token revocation.** A leaked/compromised API token stays valid until its
+  expiry — there is no deny-list or rotation, and no way to disable an account and invalidate its live
+  tokens. Account disablement + token revocation are deferred to the "account management" increment. This
+  is an acknowledged availability/abuse gap, NOT a confidentiality break: a token never yields decryption
+  or forgery (ЧАСТЬ A); mitigate operationally with short `TokenTTL`.
 
 ## E. Server storage
 - Metadata: SQLite via the pure-Go `modernc.org/sqlite` (no cgo). Tables: `accounts`, `repos`,
@@ -93,7 +108,9 @@ Authentication: `Authorization: Bearer {token}` on every data and admin endpoint
   transaction (`UPDATE ... SET version=?, blob=? WHERE repo_id=? AND version=?`; 0 rows affected → 412).
 
 ## F. Out of scope (next increment; ЧАСТЬ F)
-GC of orphaned packs; quotas; rate-limiting; account management beyond creation; in-app TLS termination.
+GC of orphaned packs; quotas; rate-limiting; account management beyond creation (including account
+disablement and API-token revocation — see the "no token revocation" limitation in ЧАСТЬ D); in-app TLS
+termination.
 Also out of scope (forced by the frozen `helper.Init`, which self-generates `repo_id`, and the
 minimal-client constraint): a one-shot CLI command for a founder to provision a repo's genesis over HTTP.
 The genesis flow is: founder runs `encgit init` locally → reports `repo_id` to an admin → admin

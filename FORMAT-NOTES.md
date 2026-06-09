@@ -325,6 +325,40 @@ Decisions taken within the freedom of the Tier-4 brief; the v2 format and `store
 - SQLite via `modernc.org/sqlite` (pure Go, no cgo); `SetMaxOpenConns(1)` serializes DB access for
   deterministic CAS under concurrency (a memory/locking simplification, not a quota).
 
+### Auth hardening pass (verify + fixes)
+A narrow verify pass over the auth layer (no format/interface/design change). Most invariants were already
+satisfied and were confirmed in place, not re-touched:
+- Middleware order: every data handler calls `authRepo` (auth→role) and every admin handler calls
+  `authAdmin` (auth→admin) as their first statement, before any body read or storage access — no route
+  bypasses its check. `repo_id` is always taken from the path; tokens carry no `repo_id`.
+- Per-request expiry (`authenticate`: `now >= exp → reject`), constant-time compares (password via
+  `subtle.ConstantTimeCompare`; token hash via `constantTimeEqualHex`).
+- ETag is a CAS token only. Client freshness/rollback comes solely from signed `version` +
+  `prev_manifest_hash`/`prev_roster_hash` + local pin (`engine.Fetch`, `loadTrustedRoster`); the roster
+  path discards the store version entirely. A lying ETag/`version==0` can only DoS, never pass off stale
+  or forged state (ЧАСТЬ A).
+
+Two real defects were fixed:
+- **Atomic single-use consume.** `consumeBootstrap`/`consumeInvite` were SELECT-then-UPDATE. Rewritten to a
+  guarded `UPDATE ... WHERE used=0 [AND expiry>?]` + `RowsAffected==1`, with the account/binding INSERTs in
+  the same transaction (a failed INSERT rolls back the claim, so the token is not burned). The invite's
+  (repo_id, role) is read from the claimed row, so a redeemer cannot retarget the repo or escalate the
+  role. Note: `SetMaxOpenConns(1)` already serialized transactions, so the prior code was not exploitable
+  *in practice* — but the invariant silently depended on pool size 1; the atomic claim makes single-use
+  hold regardless. Used/expired/unknown now collapse to one generic `errBadToken` (handler → identical
+  401).
+- **Login anti-enumeration.** `login` early-returned for an unknown username, skipping argon2id — a timing
+  oracle. It now runs an equivalent-cost argon2id decoy pass (fixed valid salt+params+hash) in the
+  unknown-user branch and returns the same generic error. argon2id is indirected through a package var
+  (`argon2IDKey`) purely so a test can count invocations and prove both branches do the work; production
+  never reassigns it.
+
+### Known limitation: no token revocation (v1)
+A leaked/compromised API token is valid until expiry — no deny-list, rotation, or account-disable path that
+invalidates live tokens. Deferred to the account-management increment. Acknowledged availability/abuse gap,
+not a confidentiality break (a token never yields decryption/forgery). Operational mitigation: short
+`TokenTTL`. Recorded in `docs/FORMAT-SPEC-TIER4.md` (ЧАСТЬ D + F).
+
 ### Scope boundary (flagged honestly)
 - The TLS terminator, GC, quotas, and rate-limiting are deferred (ЧАСТЬ F).
 - **Founder genesis provisioning over HTTP is not a one-shot CLI command.** `helper.Init` is frozen and
