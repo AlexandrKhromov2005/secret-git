@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
+	"strings"
 
 	"encgit/internal/server"
 )
@@ -20,7 +22,25 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address (plain HTTP; put a TLS proxy in front)")
 	dbPath := flag.String("db", "encgit-server.db", "SQLite metadata database path")
 	blobDir := flag.String("blobs", "encgit-blobs", "directory for per-repo blob storage")
+	clientIPHeader := flag.String("client-ip-header", "",
+		"header carrying the real client IP behind a trusted proxy (e.g. X-Forwarded-For); empty = trust none")
+	trustedProxyCIDRs := flag.String("trusted-proxy-cidrs", "",
+		"comma-separated CIDRs of trusted reverse proxies; -client-ip-header is honored ONLY for connections from these")
 	flag.Parse()
+
+	cfg := server.DefaultConfig()
+	cfg.ClientIPHeader = *clientIPHeader
+	if cidrs, err := parseCIDRs(*trustedProxyCIDRs); err != nil {
+		log.Fatalf("trusted-proxy-cidrs: %v", err)
+	} else {
+		cfg.TrustedProxyCIDRs = cidrs
+	}
+	if cfg.ClientIPHeader != "" && len(cfg.TrustedProxyCIDRs) == 0 {
+		// Fail-closed warning: a header without a trusted-proxy allowlist is never trusted,
+		// so per-IP throttling collapses to the proxy's address (degradation, not a hole).
+		fmt.Fprintln(os.Stderr, "warning: -client-ip-header set but -trusted-proxy-cidrs empty; "+
+			"the header is NOT trusted and per-IP login throttling will key on the proxy address")
+	}
 
 	st, err := server.OpenStorage(*dbPath, *blobDir)
 	if err != nil {
@@ -42,7 +62,28 @@ func main() {
 			"(only its SHA-256 is stored; it cannot be recovered)\n\n", token)
 	}
 
-	srv := server.New(st, server.DefaultConfig())
+	srv := server.New(st, cfg)
 	fmt.Fprintf(os.Stderr, "encgit-server listening on %s (plain HTTP — front with a TLS proxy)\n", *addr)
 	log.Fatal(http.ListenAndServe(*addr, srv.Handler()))
+}
+
+// parseCIDRs parses a comma-separated list of CIDR prefixes (empty -> nil).
+func parseCIDRs(s string) ([]netip.Prefix, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	var out []netip.Prefix
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", part, err)
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }
