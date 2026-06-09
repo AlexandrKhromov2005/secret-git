@@ -107,6 +107,14 @@ CREATE TABLE IF NOT EXISTS roster_state (
   repo_id TEXT PRIMARY KEY,
   version INTEGER NOT NULL,
   blob    BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS login_throttle (
+  scope        TEXT NOT NULL,
+  key          TEXT NOT NULL,
+  fail_count   INTEGER NOT NULL,
+  window_until INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  PRIMARY KEY (scope, key)
 );`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("server: migrate: %w", err)

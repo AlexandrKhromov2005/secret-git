@@ -39,8 +39,16 @@ var argon2IDKey = argon2.IDKey
 // Anti-enumeration decoy: a syntactically valid salt+params+hash with the SAME argon2id
 // cost, used to perform equivalent work when a login names an unknown username, so the
 // response time does not reveal whether the username exists.
-// SECURITY-REVIEW: anti-enumeration — argon2id runs in both login branches (real verify
-// and decoy); see (*Storage).login.
+//
+// INVARIANT (load-bearing): the decoy's cost MUST equal the cost of a real verify, or the
+// timing diverges and enumeration reopens. Today argon2-params are process-global — every
+// hashPassword uses the same constants — so the decoy mirrors them via formatParams() and
+// the argonSaltLen/argonKeyLen constants. If params ever become per-account or versioned,
+// the decoy MUST mirror the cost of the specific account being probed; the silent
+// dependency is pinned by TestDecoyArgonParamsMatchProduction, which fails if hashPassword's
+// emitted params/lengths ever drift from the decoy.
+// SECURITY-REVIEW: decoy cost == production cost; argon2id runs in both login branches
+// (real verify and decoy); see (*Storage).login.
 var (
 	decoyArgonSaltHex = strings.Repeat("ab", argonSaltLen)
 	decoyArgonParams  = formatParams()

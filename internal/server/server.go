@@ -6,32 +6,65 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// Config tunes the server's token/invite lifetimes and request limits.
+// Config tunes the server's token/invite lifetimes, request limits, and the /auth/login
+// rate-limiting layer.
 type Config struct {
 	TokenTTL   time.Duration // API session token lifetime
 	InviteTTL  time.Duration // invite token lifetime
 	MaxBodyLen int64         // memory-safety bound on a single request body (NOT a quota)
+
+	// /auth/login rate limiting (see throttle.go).
+	LoginBackoffBase     time.Duration // BASE: first backoff window
+	LoginBackoffMax      time.Duration // MAX_BACKOFF: finite ceiling (no hard lockout)
+	ThrottlePruneGrace   time.Duration // rows whose window expired this long ago are pruned
+	MaxConcurrentArgon2  int           // ceiling on simultaneous argon2id (peak-memory bond)
+	Argon2AcquireTimeout time.Duration // max wait for a slot before a cheap 503
+
+	// Client-IP extraction behind the mandatory reverse proxy (ЧАСТЬ C). Fail-closed: with
+	// no trusted proxy CIDRs and/or no header name, the per-IP key is r.RemoteAddr's host.
+	// The proxy header is trusted ONLY for connections whose source address is in
+	// TrustedProxyCIDRs, and only its rightmost token is used.
+	TrustedProxyCIDRs []netip.Prefix // source addresses whose ClientIPHeader is trusted
+	ClientIPHeader    string         // e.g. "X-Forwarded-For"; "" => never trust a header
 }
 
-// DefaultConfig returns sensible defaults.
+// DefaultConfig returns sensible defaults. Client-IP extraction is fail-closed (no proxy
+// header trusted) until an operator configures TrustedProxyCIDRs + ClientIPHeader.
 func DefaultConfig() Config {
-	return Config{TokenTTL: 24 * time.Hour, InviteTTL: 72 * time.Hour, MaxBodyLen: 1 << 31}
+	return Config{
+		TokenTTL:             24 * time.Hour,
+		InviteTTL:            72 * time.Hour,
+		MaxBodyLen:           1 << 31,
+		LoginBackoffBase:     time.Second,      // SECURITY-REVIEW: BASE = 1s
+		LoginBackoffMax:      60 * time.Second, // SECURITY-REVIEW: MAX_BACKOFF = 60s (finite)
+		ThrottlePruneGrace:   time.Hour,
+		MaxConcurrentArgon2:  4,               // SECURITY-REVIEW: ~4×19MiB peak argon2id
+		Argon2AcquireTimeout: 2 * time.Second, // SECURITY-REVIEW: cheap 503 past this
+	}
 }
 
 // Server is the Tier-4 HTTP authorizer over a Storage. It never inspects blob/manifest
 // content (ЧАСТЬ A): bodies are opaque bytes.
 type Server struct {
 	*Storage
-	cfg Config
+	cfg       Config
+	argon2Sem chan struct{} // in-process argon2id concurrency limiter (capacity = MaxConcurrentArgon2)
 }
 
 // New builds a Server.
-func New(st *Storage, cfg Config) *Server { return &Server{Storage: st, cfg: cfg} }
+func New(st *Storage, cfg Config) *Server {
+	n := cfg.MaxConcurrentArgon2
+	if n < 1 {
+		n = 1
+	}
+	return &Server{Storage: st, cfg: cfg, argon2Sem: make(chan struct{}, n)}
+}
 
 // Handler returns the HTTP handler with all routes.
 func (s *Server) Handler() http.Handler {
@@ -206,10 +239,54 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	token, err := s.login(req.Username, req.Password, s.cfg.TokenTTL)
+	now := time.Now().Unix()
+	ipKey := clientIP(r, s.cfg)
+	userKey := req.Username // the presented username, verbatim — see throttle symmetry note
+
+	// Step 1: cheap reject inside an active backoff window, BEFORE any argon2id. The
+	// per-IP and per-user windows are checked identically for existing and unknown users.
+	graceSec := int64(s.cfg.ThrottlePruneGrace / time.Second)
+	blockedUntil, err := s.throttleStatus(now, ipKey, userKey, graceSec)
 	if err != nil {
-		// Same response for unknown user and wrong password (no user enumeration).
-		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if blockedUntil > now {
+		// SECURITY-REVIEW: load-bearing — 429 returned WITHOUT reaching argon2id.
+		w.Header().Set("Retry-After", strconv.FormatInt(blockedUntil-now, 10))
+		http.Error(w, "too many login attempts", http.StatusTooManyRequests)
+		return
+	}
+
+	// Step 2: bound peak argon2id memory — a cheap 503 if saturated, BEFORE argon2id. The
+	// slot covers s.login's single argon2id in BOTH the real-verify and decoy branches.
+	release, ok := s.acquireArgon2()
+	if !ok {
+		// SECURITY-REVIEW: load-bearing — 503 returned WITHOUT reaching argon2id.
+		http.Error(w, "server busy", http.StatusServiceUnavailable)
+		return
+	}
+	token, loginErr := s.login(req.Username, req.Password, s.cfg.TokenTTL)
+	release()
+
+	if loginErr != nil {
+		if errors.Is(loginErr, errBadToken) {
+			// Credential failure (incl. unknown username): bump backoff for BOTH scopes,
+			// then the same generic 401 (no user enumeration).
+			if err := s.throttleFail(now, ipKey, userKey, s.cfg.LoginBackoffBase, s.cfg.LoginBackoffMax); err != nil {
+				http.Error(w, "server error", http.StatusInternalServerError)
+				return
+			}
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		// Infrastructure error (not a credential signal): do not bump the throttle.
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	// Success: clear BOTH scopes.
+	if err := s.throttleReset(ipKey, userKey); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"token": token})
