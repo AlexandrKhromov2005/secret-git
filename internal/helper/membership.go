@@ -103,7 +103,11 @@ func (e *Engine) AddMember(name string, xpub, edpub [32]byte, oobFingerprint str
 	if err != nil {
 		return err
 	}
-	newRosterHash := util.SHA256Hex(plain)
+	newRosterHash := util.SHA256Hex(plain) // with-sig: roster chain + pin
+	newRosterBinding, err := newR.BindingHash()
+	if err != nil {
+		return err
+	}
 	blob, err := crypto.Encrypt(plain, e.pack.Recipient) // same key — no rotation on add
 	if err != nil {
 		return err
@@ -130,8 +134,8 @@ func (e *Engine) AddMember(name string, xpub, edpub [32]byte, oobFingerprint str
 	if err != nil {
 		return err
 	}
-	// m1 (§E): re-publish the current manifest with the NEW roster_hash, same key.
-	if err := e.republishManifest(trusted, curHash, newRosterHash, e.pack, &st); err != nil {
+	// m1 (§E): re-publish the current manifest with the NEW roster's binding hash, same key.
+	if err := e.republishManifest(trusted, newRosterBinding, e.pack, &st); err != nil {
 		return err
 	}
 	return e.pinRoster(&st, newR, plain, newRosterHash)
@@ -197,7 +201,11 @@ func (e *Engine) RemoveMember(targetFingerprint string) error {
 	if err != nil {
 		return err
 	}
-	newRosterHash := util.SHA256Hex(rplain)
+	newRosterHash := util.SHA256Hex(rplain) // with-sig: roster chain + pin
+	newRosterBinding, err := newR.BindingHash()
+	if err != nil {
+		return err
+	}
 	rblob, err := crypto.Encrypt(rplain, newPack.Recipient)
 	if err != nil {
 		return err
@@ -225,24 +233,24 @@ func (e *Engine) RemoveMember(targetFingerprint string) error {
 	}
 
 	// Re-publish the current manifest (same refs/packs) under the new key and new
-	// roster_hash so members who now hold only the new key can still read it (§E, m1).
-	if err := e.republishManifest(trusted, curHash, newRosterHash, newPack, &st); err != nil {
+	// roster binding hash so members who now hold only the new key can still read it (§E, m1).
+	if err := e.republishManifest(trusted, newRosterBinding, newPack, &st); err != nil {
 		return err
 	}
 
 	e.repoKey = newRepoKey
 	e.pack = newPack
 	st.AddKey(newRepoKey)
-	return e.pinRoster(&st, newR, rplain, util.SHA256Hex(rplain))
+	return e.pinRoster(&st, newR, rplain, newRosterHash)
 }
 
 // republishManifest re-issues the current manifest (unchanged refs/packs) at the
-// next version, stamped with newRosterHash and encrypted under newPack (which may be
-// the same key for add, or a rotated key for remove). It reads the current manifest
-// verifying it against the OLD roster (oldTrusted/oldTrustedHash). No-op if there is
-// no manifest yet (§E: the first push will carry the current roster_hash).
-func (e *Engine) republishManifest(oldTrusted *roster.Roster, oldTrustedHash, newRosterHash string, newPack *crypto.PackKeys, st *localstate.State) error {
-	cur, err := e.loadCurrent(oldTrusted, oldTrustedHash) // decrypts/verifies against the old roster
+// next version, stamped with newRosterBinding (the new roster's without-sig binding
+// hash) and encrypted under newPack (the same key for add, or a rotated key for
+// remove). It reads the current manifest verifying it against the OLD roster
+// (oldTrusted). No-op if there is no manifest yet (§E: the first push carries it).
+func (e *Engine) republishManifest(oldTrusted *roster.Roster, newRosterBinding string, newPack *crypto.PackKeys, st *localstate.State) error {
+	cur, err := e.loadCurrent(oldTrusted) // decrypts/verifies against the old roster
 	if err != nil {
 		return err
 	}
@@ -256,7 +264,7 @@ func (e *Engine) republishManifest(oldTrusted *roster.Roster, oldTrustedHash, ne
 		Refs:             cur.manifest.Refs,
 		Packs:            cur.manifest.Packs,
 		PusherKeyID:      e.member.FingerprintHex(),
-		RosterHash:       newRosterHash, // m1: bind the re-issued manifest to the new roster
+		RosterHash:       newRosterBinding, // m1: bind the re-issued manifest to the new roster
 	}
 	if err := m.Sign(e.member.SigningKey()); err != nil {
 		return err
@@ -295,7 +303,7 @@ func (e *Engine) FullRekey() error {
 	if !e.selfIsMember(trusted) {
 		return errors.New("helper: only a current member can rekey")
 	}
-	cur, err := e.loadCurrent(trusted, curRosterHash)
+	cur, err := e.loadCurrent(trusted)
 	if err != nil {
 		return err
 	}
@@ -326,7 +334,11 @@ func (e *Engine) FullRekey() error {
 	if err != nil {
 		return err
 	}
-	newRosterHash := util.SHA256Hex(rplain)
+	newRosterHash := util.SHA256Hex(rplain) // with-sig: roster chain + pin
+	newRosterBinding, err := newR.BindingHash()
+	if err != nil {
+		return err
+	}
 
 	st, _, err := e.state.Load()
 	if err != nil {
@@ -368,7 +380,7 @@ func (e *Engine) FullRekey() error {
 			Refs:             cur.manifest.Refs,
 			Packs:            newPacks,
 			PusherKeyID:      e.member.FingerprintHex(),
-			RosterHash:       newRosterHash, // m1: bind to the new roster
+			RosterHash:       newRosterBinding, // m1: bind to the new roster (without-sig)
 		}
 		if err := m.Sign(e.member.SigningKey()); err != nil {
 			return err
@@ -423,7 +435,7 @@ func (e *Engine) FullRekey() error {
 	st.AddKey(newRepoKey)
 	st.RosterPinned = true
 	st.RosterVersion = newR.Version
-	st.RosterHash = util.SHA256Hex(rplain)
+	st.RosterHash = newRosterHash // with-sig: roster chain + pin
 	st.TrustedRoster = rplain
 	return e.state.Save(st)
 }

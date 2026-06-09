@@ -42,7 +42,7 @@ func Init(st store.Store, founder *identity.Identity, founderName string) (repoI
 	if _, err := rand.Read(repoKey); err != nil {
 		return "", fmt.Errorf("helper: read repo key: %w", err)
 	}
-	keyfile, err := crypto.WrapRepoKey(0, repoKey, founder.AgeRecipient()) // generation 0
+	keyfile, err := crypto.WrapRepoKey(1, repoKey, founder.AgeRecipient()) // generation 1
 	if err != nil {
 		return "", err
 	}
@@ -61,7 +61,7 @@ func Init(st store.Store, founder *identity.Identity, founderName string) (repoI
 		PrevRosterHash:    nil,
 		Members:           []roster.Member{memberFromIdentity(founder, founderName)},
 		AuthorKeyID:       founder.FingerprintHex(),
-		RepoKeyGeneration: 0, // genesis generation (§B)
+		RepoKeyGeneration: 1, // genesis generation = 1 (§B: 0 is never valid)
 	}
 	if err := gen.Sign(founder.SigningKey()); err != nil {
 		return "", err
@@ -193,6 +193,11 @@ func (e *Engine) decryptPack(blob []byte) ([]byte, error) {
 // otherwise the keyfile is stale/forged (a downgrade) and is rejected.
 // SECURITY-REVIEW (m2): binds the keyfile to the roster's repo_key generation.
 func (e *Engine) checkKeyfileGeneration(trusted *roster.Roster) error {
+	// SECURITY-REVIEW (m2): the genesis generation is 1, so 0 is never a valid
+	// generation; reject it so a missing/zero field cannot masquerade as valid.
+	if trusted.RepoKeyGeneration == 0 || e.kfGeneration == 0 {
+		return fmt.Errorf("helper: invalid repo_key_generation 0 (genesis is 1; 0 is never valid)")
+	}
 	if e.kfGeneration != trusted.RepoKeyGeneration {
 		return fmt.Errorf("helper: keyfile generation %d does not match roster generation %d (stale/forged keyfile)",
 			e.kfGeneration, trusted.RepoKeyGeneration)
@@ -201,17 +206,22 @@ func (e *Engine) checkKeyfileGeneration(trusted *roster.Roster) error {
 }
 
 // verifyManifestWithRoster enforces §4 + m1: the manifest's roster_hash MUST equal
-// the hash of the current trusted roster, the signer named by pusher_key_id MUST be
-// a member of that roster, and the Ed25519 signature must verify under their key.
+// the BINDING hash of the current trusted roster (SHA-256 over the roster's signed
+// bytes, WITHOUT sig), the signer named by pusher_key_id MUST be a member of that
+// roster, and the Ed25519 signature must verify under their key.
 // SECURITY-REVIEW (m1): roster_hash binds the manifest to a specific roster, so a
 // manifest produced under a different (e.g. older) roster — even one signed by a
 // then-valid, since-removed member — is rejected (cross-roster splice closed).
 // SECURITY-REVIEW (§4): roster membership is the signature gate; a removed member is
 // rejected because they are no longer present.
-func (e *Engine) verifyManifestWithRoster(m *manifest.Manifest, trusted *roster.Roster, trustedHash string) error {
-	if m.RosterHash != trustedHash {
+func (e *Engine) verifyManifestWithRoster(m *manifest.Manifest, trusted *roster.Roster) error {
+	binding, err := trusted.BindingHash()
+	if err != nil {
+		return err
+	}
+	if m.RosterHash != binding {
 		return fmt.Errorf("helper: manifest roster_hash %s does not match current roster %s (cross-roster splice?)",
-			m.RosterHash, trustedHash)
+			m.RosterHash, binding)
 	}
 	signer, ok := trusted.FindByFingerprint(m.PusherKeyID)
 	if !ok {
@@ -231,7 +241,7 @@ type current struct {
 	hash     string // SHA-256 of the canonical plaintext (empty when none)
 }
 
-func (e *Engine) loadCurrent(trusted *roster.Roster, trustedHash string) (*current, error) {
+func (e *Engine) loadCurrent(trusted *roster.Roster) (*current, error) {
 	blob, version, err := e.store.GetManifest()
 	if err != nil {
 		return nil, err
@@ -247,7 +257,7 @@ func (e *Engine) loadCurrent(trusted *roster.Roster, trustedHash string) (*curre
 	if err != nil {
 		return nil, err
 	}
-	if err := e.verifyManifestWithRoster(m, trusted, trustedHash); err != nil {
+	if err := e.verifyManifestWithRoster(m, trusted); err != nil {
 		return nil, err
 	}
 	return &current{manifest: m, version: version, hash: util.SHA256Hex(plain)}, nil
@@ -298,7 +308,7 @@ func (e *Engine) Push(refs []string) error {
 	if err := e.refreshPackKeys(); err != nil {
 		return err
 	}
-	trusted, trustedHash, err := e.loadTrustedRoster()
+	trusted, _, err := e.loadTrustedRoster()
 	if err != nil {
 		return err
 	}
@@ -307,6 +317,11 @@ func (e *Engine) Push(refs []string) error {
 	}
 	if _, ok := trusted.FindByFingerprint(e.member.FingerprintHex()); !ok {
 		return errors.New("helper: cannot push: you are not in the current roster")
+	}
+	// m1: bind every push to the current roster via the without-sig binding hash.
+	rosterBinding, err := trusted.BindingHash()
+	if err != nil {
+		return err
 	}
 
 	if len(refs) == 0 {
@@ -334,7 +349,7 @@ func (e *Engine) Push(refs []string) error {
 
 	var lastErr error
 	for attempt := 0; attempt < maxPushRetries; attempt++ {
-		cur, err := e.loadCurrent(trusted, trustedHash)
+		cur, err := e.loadCurrent(trusted)
 		if err != nil {
 			return err
 		}
@@ -380,7 +395,7 @@ func (e *Engine) Push(refs []string) error {
 			Refs:             newRefs,
 			Packs:            newPacks,
 			PusherKeyID:      e.member.FingerprintHex(),
-			RosterHash:       trustedHash, // m1: bind this push to the current roster
+			RosterHash:       rosterBinding, // m1: bind this push to the current roster (without-sig hash)
 		}
 		// SECURITY-REVIEW (§7.2): sign-then-encrypt — sign the sig-less canonical
 		// bytes (which cover repo_id, version, prev_manifest_hash, roster_hash), then encrypt.
@@ -421,7 +436,7 @@ func (e *Engine) Fetch() error {
 	if err := e.refreshPackKeys(); err != nil {
 		return err
 	}
-	trusted, trustedHash, err := e.loadTrustedRoster()
+	trusted, _, err := e.loadTrustedRoster()
 	if err != nil {
 		return err
 	}
@@ -448,7 +463,7 @@ func (e *Engine) Fetch() error {
 	}
 	// m1 + §4: roster_hash must bind to the current roster, signer must be a member,
 	// and the signature must verify.
-	if err := e.verifyManifestWithRoster(m, trusted, trustedHash); err != nil {
+	if err := e.verifyManifestWithRoster(m, trusted); err != nil {
 		return err
 	}
 	newHash := util.SHA256Hex(plain)

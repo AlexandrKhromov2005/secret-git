@@ -160,9 +160,23 @@ func (r *Roster) CanonicalBytes() ([]byte, error) {
 	return manifest.CanonicalJSON(obj)
 }
 
-// Hash returns SHA-256(CanonicalBytes) as hex.
+// Hash returns SHA-256(CanonicalBytes) as hex — the WITH-sig roster hash used by
+// prev_roster_hash (the roster chain) and the local pin (frozen Tier-3 convention).
 func (r *Roster) Hash() (string, error) {
 	b, err := r.CanonicalBytes()
+	if err != nil {
+		return "", err
+	}
+	return util.SHA256Hex(b), nil
+}
+
+// BindingHash returns SHA-256(SigningBytes) as hex — the hash over EXACTLY the
+// JCS-canonical bytes the roster signature is computed over (the signed part, WITHOUT
+// the sig field). This is the v2 manifest.roster_hash preimage (m1); it is
+// deliberately distinct from Hash() (which includes sig and chains the roster).
+// SECURITY-REVIEW (m1): roster_hash preimage = SHA-256(JCS(roster signed-part, no sig)).
+func (r *Roster) BindingHash() (string, error) {
+	b, err := r.SigningBytes()
 	if err != nil {
 		return "", err
 	}

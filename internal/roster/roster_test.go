@@ -183,6 +183,41 @@ func TestRosterRepoKeyGenerationSigned(t *testing.T) {
 	}
 }
 
+// TestBindingHashIsOverSignedBytesWithoutSig pins the v2 roster_hash preimage: it is
+// SHA-256 over the roster's signing bytes (without sig), distinct from the with-sig
+// Hash() used by prev_roster_hash and the pin.
+func TestBindingHashIsOverSignedBytesWithoutSig(t *testing.T) {
+	m0, priv0 := makeMember(t, "alice", 1)
+	fp0, _ := m0.Fingerprint()
+	r := &Roster{RepoID: "r", Version: 0, Members: []Member{m0}, AuthorKeyID: fp0, RepoKeyGeneration: 1}
+	if err := r.Sign(priv0); err != nil {
+		t.Fatal(err)
+	}
+
+	signing, err := r.SigningBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(signing)
+	want := hex.EncodeToString(sum[:])
+
+	binding, err := r.BindingHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding != want {
+		t.Fatalf("BindingHash = %s, want SHA-256(SigningBytes) = %s", binding, want)
+	}
+
+	withSig, err := r.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding == withSig {
+		t.Fatal("BindingHash (without sig) must differ from Hash (with sig)")
+	}
+}
+
 func TestRosterGenesisPrevNull(t *testing.T) {
 	m0, priv0 := makeMember(t, "alice", 1)
 	fp0, _ := m0.Fingerprint()

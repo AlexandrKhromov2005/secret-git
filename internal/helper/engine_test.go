@@ -14,6 +14,7 @@ import (
 	"encgit/internal/identity"
 	"encgit/internal/localstate"
 	"encgit/internal/manifest"
+	"encgit/internal/roster"
 	"encgit/internal/store"
 	"encgit/internal/store/localfs"
 	"encgit/internal/util"
@@ -123,8 +124,9 @@ func derivePackKeys(t *testing.T, st store.Store, member *identity.Identity, rep
 	return pk
 }
 
-// currentRosterHash decrypts the current roster and returns its canonical hash,
-// for stamping forged manifests with a roster_hash the victim will accept.
+// currentRosterHash decrypts the current roster and returns its BINDING hash (the
+// without-sig hash used by manifest.roster_hash, m1), for stamping forged manifests
+// with a roster_hash the victim will accept.
 func currentRosterHash(t *testing.T, st store.Store, member *identity.Identity, repoID string) string {
 	t.Helper()
 	pk := derivePackKeys(t, st, member, repoID)
@@ -136,7 +138,15 @@ func currentRosterHash(t *testing.T, st store.Store, member *identity.Identity, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return util.SHA256Hex(plain)
+	r, err := roster.Parse(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := r.BindingHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
 }
 
 // installSignedManifest signs m with the given member, optionally corrupts it,
