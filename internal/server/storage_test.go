@@ -2,7 +2,9 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -104,13 +106,14 @@ func TestInviteOneTimeExpiryAndBinding(t *testing.T) {
 		t.Fatalf("second redeem: want errBadToken, got %v", err)
 	}
 
-	// An expired invite is rejected.
+	// An expired invite is rejected. Used/expired/unknown collapse to one generic
+	// rejection (errBadToken) — see consumeInvite (ЧАСТЬ A: единый ответ, no oracle).
 	expired, err := st.createInvite("repoA", RoleReader, -time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.consumeInvite(expired, "dave", "pw"); !errors.Is(err, errUsedOrExpired) {
-		t.Fatalf("expired invite: want errUsedOrExpired, got %v", err)
+	if err := st.consumeInvite(expired, "dave", "pw"); !errors.Is(err, errBadToken) {
+		t.Fatalf("expired invite: want errBadToken, got %v", err)
 	}
 }
 
@@ -147,5 +150,162 @@ func TestLoginAndTokenLifecycle(t *testing.T) {
 	}
 	if _, err := st.authenticate(expiredTok); !errors.Is(err, errUsedOrExpired) {
 		t.Fatalf("expired token: want errUsedOrExpired, got %v", err)
+	}
+}
+
+// countSuccesses returns how many of the errors are nil.
+func countSuccesses(errs []error) int {
+	n := 0
+	for _, e := range errs {
+		if e == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// TestConcurrentBootstrapConsumeOneWinner models the check-and-mark race: many
+// goroutines exchange the SAME bootstrap token at once. The atomic single-use claim
+// must admit exactly one (one admin), the rest rejected. Distinct usernames isolate the
+// token's single-use guarantee from any account UNIQUE collision.
+func TestConcurrentBootstrapConsumeOneWinner(t *testing.T) {
+	st := openTestStorage(t)
+	tok, err := st.EnsureBootstrap()
+	if err != nil || tok == "" {
+		t.Fatalf("ensure bootstrap: token=%q err=%v", tok, err)
+	}
+
+	const n = 8
+	errs := make([]error, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = st.consumeBootstrap(tok, fmt.Sprintf("admin%d", i), "pw")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if got := countSuccesses(errs); got != 1 {
+		t.Fatalf("concurrent bootstrap consume: want exactly 1 success, got %d (%v)", got, errs)
+	}
+	admins, err := st.adminCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admins != 1 {
+		t.Fatalf("want exactly 1 admin after the race, got %d", admins)
+	}
+}
+
+// TestConcurrentInviteConsumeOneWinner is the invite analogue: many goroutines redeem
+// the SAME invite at once; exactly one account is created.
+func TestConcurrentInviteConsumeOneWinner(t *testing.T) {
+	st := openTestStorage(t)
+	if err := st.createRepo("repoA"); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := st.createInvite("repoA", RoleWriter, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 8
+	errs := make([]error, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = st.consumeInvite(tok, fmt.Sprintf("user%d", i), "pw")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if got := countSuccesses(errs); got != 1 {
+		t.Fatalf("concurrent invite consume: want exactly 1 success, got %d (%v)", got, errs)
+	}
+	var accounts int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM accounts`).Scan(&accounts); err != nil {
+		t.Fatal(err)
+	}
+	if accounts != 1 {
+		t.Fatalf("want exactly 1 account created after the race, got %d", accounts)
+	}
+}
+
+// TestInviteBindingIsServerControlled: the (repo_id, role) binding comes from the invite
+// row, not from the redeemer — a reader invite yields exactly reader on exactly its repo,
+// and grants nothing on a different repo (cannot be retargeted or escalated).
+func TestInviteBindingIsServerControlled(t *testing.T) {
+	st := openTestStorage(t)
+	if err := st.createRepo("repoA"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.createRepo("repoB"); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := st.createInvite("repoA", RoleReader, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.consumeInvite(tok, "eve", "pw"); err != nil {
+		t.Fatal(err)
+	}
+	id, _, _, _, _, err := st.accountByUsername("eve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, has, err := st.roleFor(id, "repoA")
+	if err != nil || !has || role != RoleReader {
+		t.Fatalf("repoA binding: role=%v has=%v err=%v (want reader, no escalation)", role, has, err)
+	}
+	if _, has, err := st.roleFor(id, "repoB"); err != nil || has {
+		t.Fatalf("repoB access leaked: has=%v err=%v (invite must not retarget)", has, err)
+	}
+}
+
+// TestLoginNoUserEnumeration: an unknown username and a wrong password must both return
+// the same generic rejection AND perform the same argon2id work (the decoy). argon2id is
+// counted through the argon2IDKey seam — timing is never asserted (flaky).
+func TestLoginNoUserEnumeration(t *testing.T) {
+	st := openTestStorage(t)
+	tok, _ := st.EnsureBootstrap()
+	if err := st.consumeBootstrap(tok, "alice", "correct"); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int
+	orig := argon2IDKey
+	argon2IDKey = func(password, salt []byte, time, mem uint32, threads uint8, keyLen uint32) []byte {
+		calls++
+		return orig(password, salt, time, mem, threads, keyLen)
+	}
+	defer func() { argon2IDKey = orig }()
+
+	calls = 0
+	if _, err := st.login("alice", "wrong", time.Hour); !errors.Is(err, errBadToken) {
+		t.Fatalf("wrong password: want errBadToken, got %v", err)
+	}
+	wrongPwCalls := calls
+
+	calls = 0
+	if _, err := st.login("ghost", "whatever", time.Hour); !errors.Is(err, errBadToken) {
+		t.Fatalf("unknown user: want errBadToken, got %v", err)
+	}
+	unknownCalls := calls
+
+	if wrongPwCalls == 0 || unknownCalls == 0 {
+		t.Fatalf("argon2id must run in both branches: wrongPw=%d unknownUser=%d", wrongPwCalls, unknownCalls)
+	}
+	if wrongPwCalls != unknownCalls {
+		t.Fatalf("argon2id work differs between branches (enumeration oracle): wrongPw=%d unknownUser=%d", wrongPwCalls, unknownCalls)
 	}
 }

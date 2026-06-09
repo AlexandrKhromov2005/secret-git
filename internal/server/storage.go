@@ -159,6 +159,11 @@ func (s *Storage) EnsureBootstrap() (string, error) {
 
 // consumeBootstrap verifies a bootstrap token and, on success, creates the first
 // admin account and marks the token used — all in one transaction.
+// SECURITY-REVIEW: atomic single-use bootstrap. The token is claimed by a guarded
+// UPDATE (used=0) requiring exactly one affected row; a SELECT-then-UPDATE would let two
+// concurrent exchanges of the same token both succeed (two admins). The claim precedes
+// the account INSERT inside one transaction, so a failed INSERT rolls back the claim and
+// the token is not burned.
 func (s *Storage) consumeBootstrap(token, username, password string) error {
 	salt, params, hash, err := hashPassword(password)
 	if err != nil {
@@ -171,19 +176,19 @@ func (s *Storage) consumeBootstrap(token, username, password string) error {
 	}
 	defer tx.Rollback()
 
-	var dummy int
-	row := tx.QueryRow(`SELECT 1 FROM bootstrap WHERE token_hash=? AND used=0`, th)
-	if err := row.Scan(&dummy); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errBadToken
-		}
+	res, err := tx.Exec(`UPDATE bootstrap SET used=1 WHERE token_hash=? AND used=0`, th)
+	if err != nil {
 		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return errBadToken // unknown or already-used token
 	}
 	if _, err := tx.Exec(`INSERT INTO accounts(username, argon2_salt, argon2_params, argon2_hash, is_admin) VALUES(?,?,?,?,1)`,
 		username, salt, params, hash); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE bootstrap SET used=1 WHERE token_hash=?`, th); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -208,6 +213,14 @@ func (s *Storage) accountByUsername(username string) (id int64, salt, params, ha
 func (s *Storage) login(username, password string, ttl time.Duration) (string, error) {
 	id, salt, params, hash, _, err := s.accountByUsername(username)
 	if err != nil {
+		if errors.Is(err, errNotFound) {
+			// SECURITY-REVIEW: anti-enumeration — run an equivalent-cost argon2id pass for
+			// an unknown username so login timing is indistinguishable from a wrong password,
+			// then return the same generic rejection (handler renders both as 401
+			// "invalid credentials"). No early exit that would skip argon2id.
+			_, _ = verifyPassword(password, decoyArgonSaltHex, decoyArgonParams, decoyArgonHashHex)
+			return "", errBadToken
+		}
 		return "", err
 	}
 	ok, err := verifyPassword(password, salt, params, hash)
@@ -310,46 +323,51 @@ func (s *Storage) createInvite(repoID string, role Role, ttl time.Duration) (str
 
 // consumeInvite redeems an invite to create a new account bound to its repo_id+role,
 // marking the invite used — all in one transaction.
+// SECURITY-REVIEW: atomic single-use + expiry. The invite is claimed by a guarded UPDATE
+// (used=0 AND not expired) requiring exactly one affected row; used/expired/unknown all
+// collapse to the same RowsAffected==0 rejection (errBadToken — a single generic outcome,
+// no oracle). A SELECT-then-UPDATE would let two concurrent redemptions of one invite both
+// create an account. The (repo_id, role) binding is read from the now-claimed row inside
+// the same transaction, so the redeemer cannot choose the repo or escalate the role; a
+// failed account/binding INSERT rolls the claim back and the invite is not burned.
 func (s *Storage) consumeInvite(token, username, password string) error {
 	salt, params, hash, err := hashPassword(password)
 	if err != nil {
 		return err
 	}
 	th := hashToken(token)
+	now := time.Now().Unix()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	var (
-		repoID string
-		role   string
-		exp    int64
-	)
-	row := tx.QueryRow(`SELECT repo_id, role, expiry FROM invites WHERE token_hash=? AND used=0`, th)
-	if err := row.Scan(&repoID, &role, &exp); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errBadToken
-		}
+	res, err := tx.Exec(`UPDATE invites SET used=1 WHERE token_hash=? AND used=0 AND expiry > ?`, th, now)
+	if err != nil {
 		return err
 	}
-	if time.Now().Unix() >= exp {
-		return errUsedOrExpired
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
 	}
-	res, err := tx.Exec(`INSERT INTO accounts(username, argon2_salt, argon2_params, argon2_hash, is_admin) VALUES(?,?,?,?,0)`,
+	if n != 1 {
+		return errBadToken // unknown, already-used, or expired
+	}
+	var repoID, role string
+	if err := tx.QueryRow(`SELECT repo_id, role FROM invites WHERE token_hash=?`, th).Scan(&repoID, &role); err != nil {
+		return err
+	}
+	ins, err := tx.Exec(`INSERT INTO accounts(username, argon2_salt, argon2_params, argon2_hash, is_admin) VALUES(?,?,?,?,0)`,
 		username, salt, params, hash)
 	if err != nil {
 		return err
 	}
-	accID, err := res.LastInsertId()
+	accID, err := ins.LastInsertId()
 	if err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO repo_access(account_id, repo_id, role) VALUES(?,?,?)`, accID, repoID, role); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE invites SET used=1 WHERE token_hash=?`, th); err != nil {
 		return err
 	}
 	return tx.Commit()

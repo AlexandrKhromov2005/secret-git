@@ -31,6 +31,22 @@ const (
 // is ever stored.
 const tokenBytes = 32
 
+// argon2IDKey is the argon2id primitive, indirected through a var so a test can count
+// invocations and prove the login anti-enumeration decoy actually runs argon2id in the
+// unknown-user branch. Production never reassigns it.
+var argon2IDKey = argon2.IDKey
+
+// Anti-enumeration decoy: a syntactically valid salt+params+hash with the SAME argon2id
+// cost, used to perform equivalent work when a login names an unknown username, so the
+// response time does not reveal whether the username exists.
+// SECURITY-REVIEW: anti-enumeration — argon2id runs in both login branches (real verify
+// and decoy); see (*Storage).login.
+var (
+	decoyArgonSaltHex = strings.Repeat("ab", argonSaltLen)
+	decoyArgonParams  = formatParams()
+	decoyArgonHashHex = strings.Repeat("cd", argonKeyLen)
+)
+
 // newToken returns a fresh 256-bit token, base64url (no padding), from crypto/rand.
 func newToken() (string, error) {
 	b := make([]byte, tokenBytes)
@@ -59,7 +75,7 @@ func hashPassword(password string) (saltHex, params, hashHex string, err error) 
 	if _, err := rand.Read(salt); err != nil {
 		return "", "", "", fmt.Errorf("server: read salt: %w", err)
 	}
-	sum := argon2.IDKey([]byte(password), salt, argonTime, argonMemoryKiB, argonThreads, argonKeyLen)
+	sum := argon2IDKey([]byte(password), salt, argonTime, argonMemoryKiB, argonThreads, argonKeyLen)
 	return hex.EncodeToString(salt), formatParams(), hex.EncodeToString(sum), nil
 }
 
@@ -74,7 +90,7 @@ func verifyPassword(password, saltHex, params, hashHex string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	sum := argon2.IDKey([]byte(password), salt, t, mem, p, keyLen)
+	sum := argon2IDKey([]byte(password), salt, t, mem, p, keyLen)
 	want, err := hex.DecodeString(hashHex)
 	if err != nil {
 		return false, fmt.Errorf("server: decode hash: %w", err)
