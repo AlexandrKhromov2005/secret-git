@@ -1,6 +1,7 @@
 package server
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -95,6 +96,70 @@ func TestAuthorizationMatrix(t *testing.T) {
 		if got := do(t, ts, c.method, c.path, c.token, c.body); got != c.want {
 			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// TestExpiredTokenRejectedHTTP: a real, hash-matching bearer token that has expired is
+// rejected with 401 at the HTTP layer (B3 — expiry enforced on every request).
+func TestExpiredTokenRejectedHTTP(t *testing.T) {
+	ts, st := makeServer(t)
+	if err := st.createRepo("r1"); err != nil {
+		t.Fatal(err)
+	}
+	salt, params, hash, err := hashPassword("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.db.Exec(`INSERT INTO accounts(username, argon2_salt, argon2_params, argon2_hash, is_admin) VALUES(?,?,?,?,0)`,
+		"bob", salt, params, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	if err := st.grantAccess(id, "r1", RoleReader); err != nil {
+		t.Fatal(err)
+	}
+	// A genuine token for bob, but already expired.
+	expired, err := st.login("bob", "pw", -time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := do(t, ts, "GET", "/repos/r1/manifest", expired, ""); got != 401 {
+		t.Fatalf("expired token: got %d, want 401", got)
+	}
+}
+
+// postLogin posts credentials to /auth/login and returns the status and the raw body.
+func postLogin(t *testing.T, ts *httptest.Server, username, password string) (int, string) {
+	t.Helper()
+	body := `{"username":"` + username + `","password":"` + password + `"}`
+	resp, err := http.Post(ts.URL+"/auth/login", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+// TestLoginResponseIdenticalForUnknownAndWrong: the unknown-username and wrong-password
+// responses must be byte-identical (status + body), so a caller cannot enumerate users
+// (B5). The equivalent argon2id work is asserted separately in TestLoginNoUserEnumeration.
+func TestLoginResponseIdenticalForUnknownAndWrong(t *testing.T) {
+	ts, st := makeServer(t)
+	tok, _ := st.EnsureBootstrap()
+	if err := st.consumeBootstrap(tok, "alice", "correct"); err != nil {
+		t.Fatal(err)
+	}
+
+	wrongStatus, wrongBody := postLogin(t, ts, "alice", "wrong")
+	unknownStatus, unknownBody := postLogin(t, ts, "ghost", "wrong")
+
+	if wrongStatus != http.StatusUnauthorized || unknownStatus != http.StatusUnauthorized {
+		t.Fatalf("status: wrongPw=%d unknownUser=%d, want both 401", wrongStatus, unknownStatus)
+	}
+	if wrongBody != unknownBody {
+		t.Fatalf("responses differ (enumeration): wrongPw=%q unknownUser=%q", wrongBody, unknownBody)
 	}
 }
 
