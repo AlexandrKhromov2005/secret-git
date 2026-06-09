@@ -125,6 +125,100 @@ func readPassword() (string, error) {
 	return strings.TrimRight(line, "\r\n"), err
 }
 
+// cmdPublishGenesis implements: encgit publish-genesis --store URL --repo-id HEX --from DIR --seed FILE
+//
+// It is the one-time bridge that uploads a locally-created genesis (keyfile + genesis
+// roster, already produced by `encgit init` into the --from store) to a freshly-created
+// server repo, over the SAME store.Store interface that push uses. It writes NO new crypto
+// (the bytes are already signed/wrapped by helper.Init) and adds NO new store methods. Run
+// it after the admin has created the repo with this repo_id and granted the founder writer,
+// and before the first `git push`. helper.Init and push are untouched.
+func cmdPublishGenesis(args []string) error {
+	fs := flag.NewFlagSet("publish-genesis", flag.ContinueOnError)
+	storeFlag := fs.String("store", "", "remote server URL (http(s)://...)")
+	repoID := fs.String("repo-id", "", "repo_id (hex) from init")
+	from := fs.String("from", "", "local init store directory holding the genesis (keyfile + roster)")
+	seedPath := fs.String("seed", "", "member seed file (locates the API token for --store)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *storeFlag == "" || *repoID == "" || *from == "" || *seedPath == "" {
+		return errors.New("publish-genesis: --store, --repo-id, --from and --seed are required")
+	}
+	if !isHTTPURL(*storeFlag) {
+		return errors.New("publish-genesis: --store must be an http(s):// server URL")
+	}
+	local, err := localfs.Open(*from)
+	if err != nil {
+		return err
+	}
+	remote, err := openStore(*storeFlag, *repoID, *seedPath)
+	if err != nil {
+		return err
+	}
+	return publishGenesis(local, remote)
+}
+
+// publishGenesis copies the already-signed genesis (keyfile + genesis roster) from a local
+// store to a remote store using ONLY the frozen store.Store interface. It is conservative
+// and safe to re-run: it never blindly overwrites an existing remote genesis.
+// SECURITY-REVIEW: idempotent / no-clobber — publishes only when absent, no-ops when the
+// remote already holds the byte-identical genesis, and refuses (does not overwrite) a
+// differing remote keyfile or any remote roster that is not the byte-identical genesis. The
+// roster is published with the SAME CAS baseline as helper.Init / the e2e test:
+// CASRoster(expected=0, blob, newVersion=0).
+func publishGenesis(local, remote store.Store) error {
+	kf, err := local.GetKeyfile()
+	if err != nil {
+		return fmt.Errorf("read local keyfile: %w", err)
+	}
+	rblob, _, err := local.GetRoster()
+	if err != nil {
+		return fmt.Errorf("read local roster: %w", err)
+	}
+	if rblob == nil {
+		return errors.New("no local genesis roster in --from (run `encgit init` against it first)")
+	}
+
+	published := false
+
+	// Keyfile: singleton, no CAS. Publish if absent; no-op if identical; refuse to clobber.
+	switch existing, err := remote.GetKeyfile(); {
+	case errors.Is(err, store.ErrNotFound):
+		if err := remote.PutKeyfile(kf); err != nil {
+			return fmt.Errorf("publish keyfile: %w", err)
+		}
+		published = true
+	case err != nil:
+		return fmt.Errorf("check remote keyfile: %w", err)
+	case !bytes.Equal(existing, kf):
+		return errors.New("remote already has a different keyfile; refusing to overwrite")
+	}
+
+	// Genesis roster: CAS at version 0. Publish if absent; no-op if the byte-identical
+	// genesis is already there; refuse otherwise (a differing or advanced roster).
+	switch existing, ver, err := remote.GetRoster(); {
+	case err != nil:
+		return fmt.Errorf("check remote roster: %w", err)
+	case existing == nil:
+		if err := remote.CASRoster(0, rblob, 0); err != nil {
+			return fmt.Errorf("publish genesis roster: %w", err)
+		}
+		published = true
+	case ver == 0 && bytes.Equal(existing, rblob):
+		// identical genesis already present -> no-op
+	default:
+		return fmt.Errorf("remote already has a roster (version %d); refusing to overwrite genesis", ver)
+	}
+
+	if published {
+		fmt.Println("published genesis (keyfile + roster) to the server")
+	} else {
+		fmt.Println("genesis already present on the server; nothing to do")
+	}
+	return nil
+}
+
 // cmdLogin implements: encgit login --seed FILE <url> <username>
 func cmdLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)

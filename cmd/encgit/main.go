@@ -42,6 +42,8 @@ func main() {
 		err = cmdFetch(os.Args[2:])
 	case "login":
 		err = cmdLogin(os.Args[2:])
+	case "publish-genesis":
+		err = cmdPublishGenesis(os.Args[2:])
 	case "member-add":
 		err = cmdMemberAdd(os.Args[2:])
 	case "member-remove":
@@ -75,11 +77,18 @@ usage:
   encgit member-remove  --store DIR --seed FILE --repo-id HEX --fingerprint HEX [--git DIR]
   encgit rekey          --store DIR --seed FILE --repo-id HEX [--git DIR]
   encgit login          --seed FILE URL USERNAME
+  encgit publish-genesis --store URL --repo-id HEX --from DIR --seed FILE
 
 --store accepts a localfs directory OR an http(s):// server URL (Tier 4). For a URL,
 run 'encgit login --seed FILE URL USERNAME' first to obtain an API token (stored next
 to the seed). member-add takes the new member's public keys and OOB-verified
 fingerprint (from 'encgit identity show', confirmed out of band).
+
+To bring up a server-backed repo from scratch: 'encgit init' locally, give the printed
+repo_id + fingerprint to an admin out of band, have the admin create the repo with that
+repo_id and grant you writer, then 'encgit login', 'encgit publish-genesis --store URL
+--repo-id HEX --from <init-store-dir> --seed FILE', and finally 'encgit push'. See
+docs/FORMAT-SPEC-TIER4.md ("Founder genesis provisioning").
 `)
 }
 
@@ -256,8 +265,9 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("initialized repo\nrepo_id: %s\n", repoID)
-	fmt.Println("(share repo_id and the keyfile with members out of band; pass --repo-id on push/fetch)")
+	fmt.Printf("initialized repo\nrepo_id: %s\nfingerprint: %s\n", repoID, id.FingerprintHex())
+	fmt.Println("(localfs: share repo_id + keyfile out of band, pass --repo-id on push/fetch.")
+	fmt.Println(" server: give repo_id + fingerprint to your admin, then login + publish-genesis + push.)")
 	return nil
 }
 
