@@ -124,11 +124,10 @@ GC of orphaned packs; quotas; account management beyond creation (including acco
 API-token revocation — see the "no token revocation" limitation in ЧАСТЬ D); in-app TLS termination;
 CAPTCHA; defense against a fully distributed (many-IP × many-username) login attack beyond §H.
 (`/auth/login` rate-limiting itself is now implemented — see §H.)
-Also out of scope (forced by the frozen `helper.Init`, which self-generates `repo_id`, and the
-minimal-client constraint): a one-shot CLI command for a founder to provision a repo's genesis over HTTP.
-The genesis flow is: founder runs `encgit init` locally → reports `repo_id` to an admin → admin
-`POST /repos {repo_id, founder_username}` + a writer invite → founder logs in and uploads the genesis
-keyfile+roster. The e2e test performs this upload directly; a dedicated provisioning command is deferred.
+Still out of scope (a deliberate choice, forced by the frozen `helper.Init`, which self-generates
+`repo_id` and writes the genesis locally): a *one-shot* `encgit init --store URL` that both creates and
+provisions a server repo. Bringing up a server-backed repo is instead a short sequence with a dedicated
+`encgit publish-genesis` step — see §I.
 
 ## G. Client
 - The store is selected by the `--store` value's scheme: an `http://`/`https://` URL → the HTTP store;
@@ -177,3 +176,41 @@ by the semaphore, and guessing a specific account is still bounded by the per-us
 distributed attack (many IPs × many usernames) can therefore cause argon2id work, but not unbounded memory
 and not fast guessing of any one account. CAPTCHA / global-rate / proof-of-work defenses against that are
 out of scope (§F).
+
+## I. Founder genesis provisioning (flow)
+Bringing up a server-backed repo from scratch is a short sequence, not one command:
+
+1. **Founder, locally:** `encgit init --store <dir> --seed FILE` → generates `repo_id`, the repo key, the
+   genesis roster (v0) and the keyfile, writing them to the local `<dir>` store. It prints `repo_id` and
+   the founder `fingerprint`.
+2. **Founder → admin, out of band:** hand over `repo_id` (and the `fingerprint`, for the same roster
+   fingerprint-verification members already do at add time).
+3. **Admin, on the server:** `POST /repos {repo_id}` with that exact `repo_id` (the server stores the id
+   it is given; it does not generate one), then grant the founder writer — either `POST /repos {repo_id,
+   founder_username}` if the account exists, or issue a writer invite the founder redeems at
+   `POST /auth/register`.
+4. **Founder:** `encgit login --seed FILE URL founder` (saves the API token next to the seed), then
+   **`encgit publish-genesis --store URL --repo-id HEX --from <dir> --seed FILE`** — this uploads the
+   already-signed genesis (keyfile + genesis roster) from the local `<dir>` to the server over the same
+   `store.Store` interface push uses (no new crypto, no new store methods). Then `encgit push` publishes
+   the first manifest + packs.
+5. **Further members:** added by the Tier-3 membership flow (`member-add` → keyfile re-wrap) and given API
+   accounts by Tier-4 invites — two ORTHOGONAL mechanisms.
+
+**Why a sequence, not a one-shot `init --store URL`.** `helper.Init` is frozen: it self-generates `repo_id`
+and writes the genesis into a *local* store. But the HTTP store needs `repo_id` to route, and the admin
+creates the repo (with access control) and grants writer *before* the founder may write — so a single
+command cannot both invent `repo_id` and land the genesis in a pre-authorized server repo. `publish-genesis`
+is the explicit bridge: a separate, after-the-fact transfer of finished bytes. `git push` is deliberately
+left untouched (it publishes only manifest + packs).
+
+**Why `publish-genesis` is safe to re-run.** The keyfile is a singleton and the roster is published with
+the genesis CAS baseline `CASRoster(expected=0, blob, newVersion=0)` (exactly as `helper.Init`). The command
+first reads the remote: it publishes only what is absent, no-ops when the remote already holds the
+byte-identical genesis, and refuses (never overwrites) a differing remote keyfile or any remote roster that
+is not the byte-identical genesis (e.g. one already advanced past v0). // SECURITY-REVIEW.
+
+**Orthogonality (account ↔ roster).** Creating an account or redeeming an invite grants only API access
+(`accounts`/`repo_access`); it confers NO cryptographic membership. Being added to the roster grants
+cryptographic membership; it confers NO API access. A compromised server/account can withhold or junk
+ciphertext (DoS) but can never decrypt or forge — provisioning does not change that. // SECURITY-REVIEW.

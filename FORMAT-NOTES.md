@@ -392,11 +392,38 @@ of argon2id; the cheap rejects (429/503) happen BEFORE argon2id — the load-bea
 ### Scope boundary (flagged honestly)
 - The TLS terminator, GC, and quotas are deferred (ЧАСТЬ F). `/auth/login` rate-limiting is now implemented
   (see above); account management / token revocation remain deferred.
-- **Founder genesis provisioning over HTTP is not a one-shot CLI command.** `helper.Init` is frozen and
-  self-generates `repo_id`, while the HTTP store needs `repo_id` to route and the admin creates the repo
-  (with access control) before the founder writes — so a single `encgit init --store URL` cannot both
-  generate `repo_id` and write the genesis to a pre-authorized server repo. The operational flow is:
-  founder `encgit init` locally → reports `repo_id` to an admin → admin `POST /repos {repo_id,
-  founder_username}` (+ writer invite) → founder logs in and uploads the genesis keyfile+roster. The e2e
-  test does this upload inline; a dedicated provisioning command is the next increment (it would NOT touch
-  the frozen format or interface).
+- **Founder genesis provisioning is a sequence with a dedicated `publish-genesis` step (now closed).**
+  `helper.Init` is frozen and self-generates `repo_id`, writing the genesis into a *local* store, while the
+  HTTP store needs `repo_id` to route and the admin creates the repo (with access control) before the
+  founder writes — so a one-shot `encgit init --store URL` cannot both generate `repo_id` and land the
+  genesis in a pre-authorized server repo (still out of scope, deliberately). Flow: founder `encgit init`
+  locally → `repo_id`+fingerprint to admin OOB → admin `POST /repos {repo_id}` + writer (invite or
+  `founder_username`) → founder `encgit login` → `encgit publish-genesis` → `git push`. Documented as the
+  official flow in `docs/FORMAT-SPEC-TIER4.md` §I.
+
+### Founder provisioning: `publish-genesis` (closing the seam)
+- **Decision: a separate CLI command over the store interface, not a smarter Init/push.** `publish-genesis`
+  reads the already-signed genesis (keyfile + genesis roster) from the local `--from` store and writes it to
+  the remote via the SAME frozen `store.Store` methods push uses (`GetKeyfile`/`PutKeyfile`,
+  `GetRoster`/`CASRoster`). It is a transfer of finished, signed/wrapped bytes — **no new crypto, no new
+  store methods, `helper.Init` and `push` untouched.** We deliberately rejected a "smart first-push that
+  also uploads the genesis" (would entangle the frozen push protocol) and a one-shot init-over-HTTP.
+- **Idempotency / no-clobber.** keyfile is a singleton; the genesis roster uses the same CAS baseline as
+  `helper.Init` and the e2e test: `CASRoster(expected=0, blob, newVersion=0)`. The command first reads the
+  remote: publishes only what is absent, no-ops on a byte-identical genesis, and **refuses** (never
+  overwrites) a differing remote keyfile or a remote roster that isn't the byte-identical genesis (e.g.
+  already advanced past v0). Re-running after a successful provision is a clean no-op.
+- **Proof the seam is closed:** `cmd/encgit` `TestFullCLIFlowFromScratch` runs the entire bring-up through
+  the encgit commands against a real test server — init → admin create-repo+grant → login →
+  `publish-genesis` (the command, NOT direct store calls) → push → fresh-clone fetch — and the fetch fully
+  decrypts/verifies (keyfile, roster+manifest signatures, m1/m2), so the genesis really landed and is valid.
+- **Orthogonality (account ↔ roster), documented:** account/invite grants only API access; roster membership
+  grants only crypto membership; neither implies the other. // SECURITY-REVIEW in the spec.
+
+### Anti-enumeration: third facet closed (429-in-window symmetry)
+The decoy (equal argon2id work) and the symmetric per-user counter already covered the 401 path. Closed the
+remaining facet: the 429 returned while a per-user backoff window is open is computed only from the window
+(status, generic body, `Retry-After` from one formula), so it is identical for an existing vs unknown
+username. Pinned by `TestLoginThrottle429SymmetricOverExistence` (per-IP isolated via the trusted proxy
+header so only the per-user scope blocks; Retry-After compared within a small clock tolerance). The existing
+401-identity, per-user-symmetry, and decoy-params guard tests still pass.
