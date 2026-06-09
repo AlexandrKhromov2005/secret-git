@@ -252,7 +252,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if blockedUntil > now {
-		// SECURITY-REVIEW: load-bearing — 429 returned WITHOUT reaching argon2id.
+		// SECURITY-REVIEW: load-bearing — 429 returned WITHOUT reaching argon2id, and the
+		// response (status, body, Retry-After) is computed only from the window, identically
+		// for existing and unknown usernames, so it is not an existence oracle.
 		w.Header().Set("Retry-After", strconv.FormatInt(blockedUntil-now, 10))
 		http.Error(w, "too many login attempts", http.StatusTooManyRequests)
 		return

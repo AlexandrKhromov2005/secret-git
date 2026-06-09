@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -284,6 +285,46 @@ func TestLoginThrottlePerUserSymmetric(t *testing.T) {
 	}
 	if knownSecond != http.StatusTooManyRequests || ghostSecond != http.StatusTooManyRequests {
 		t.Fatalf("per-user throttle not symmetric over existence: known=%d ghost=%d, want both 429", knownSecond, ghostSecond)
+	}
+}
+
+// TestLoginThrottle429SymmetricOverExistence: the third anti-enumeration facet. With an
+// EQUAL attempt history, a known user and a ghost that land in a per-user backoff window
+// get an IDENTICAL 429 response — same status, same body, same Retry-After (within a small
+// clock tolerance). per-IP is isolated by varying the client IP per request, so the block
+// can only come from the per-user scope. A long backoff base makes the window robust.
+// SECURITY-REVIEW: 429-in-window response is symmetric over username existence.
+func TestLoginThrottle429SymmetricOverExistence(t *testing.T) {
+	cfg := proxyTrustCfg()
+	cfg.LoginBackoffBase = 30 * time.Second // one failure -> ~30s window, robustly in-window
+	cfg.LoginBackoffMax = 60 * time.Second
+	ts, st := makeServerCfg(t, cfg)
+	tok, _ := st.EnsureBootstrap()
+	if err := st.consumeBootstrap(tok, "alice", "correct"); err != nil {
+		t.Fatal(err)
+	}
+
+	// One failure from IP-A opens the per-user window; probe from a FRESH IP-B so only the
+	// per-user scope can block, and capture the 429.
+	probe := func(user, ipA, ipB string) (int, string, int) {
+		loginReqIP(t, ts, user, "wrong", ipA).Body.Close()
+		r := loginReqIP(t, ts, user, "wrong", ipB)
+		defer r.Body.Close()
+		body, _ := io.ReadAll(r.Body)
+		ra, _ := strconv.Atoi(r.Header.Get("Retry-After"))
+		return r.StatusCode, string(body), ra
+	}
+	kCode, kBody, kRA := probe("alice", "198.51.100.1", "198.51.100.2") // existing user
+	gCode, gBody, gRA := probe("ghost", "203.0.113.1", "203.0.113.2")   // non-existent user
+
+	if kCode != http.StatusTooManyRequests || gCode != http.StatusTooManyRequests {
+		t.Fatalf("status: known=%d ghost=%d, want both 429", kCode, gCode)
+	}
+	if kBody != gBody {
+		t.Fatalf("429 body differs over existence (enumeration): known=%q ghost=%q", kBody, gBody)
+	}
+	if d := kRA - gRA; d < -2 || d > 2 {
+		t.Fatalf("Retry-After differs beyond tolerance (enumeration): known=%d ghost=%d", kRA, gRA)
 	}
 }
 
