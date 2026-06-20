@@ -1,0 +1,42 @@
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Docker artifacts
+Docker/*
+!Docker/Dockerfile
+
+# markdown
+*.md
+!LICENSE
+!README.md
+!docs/
+!docs/FORMAT-SPEC*.md
+
+# исключаем остальные docs
+docs/*
+!docs/FORMAT-SPEC.md
+!docs/FORMAT-SPEC-TIER3.md
+!docs/FORMAT-SPEC-TIER4.md
+
+# local runtime / secrets
+*.db
+*.seed
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.token
+.env
+.env.*
+secrets/
+keys/
+blobs/
+data/
+tmp/
+dist/
+build/
+coverage/
+*.log
