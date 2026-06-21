@@ -214,7 +214,13 @@ func TestLoginResponseIdenticalForUnknownAndWrong(t *testing.T) {
 // the window is rejected 429 + Retry-After WITHOUT running argon2id (the load-bearing
 // invariant). argon2id invocations are counted through the seam.
 func TestLoginThrottle429WithoutArgon2(t *testing.T) {
-	ts, st := makeServer(t)
+	// A long backoff base makes the opened window robust against wall-clock second
+	// boundaries (the throttle window is whole-second granular); with the 1s default the
+	// two back-to-back requests could straddle a second and see the window as expired.
+	cfg := DefaultConfig()
+	cfg.LoginBackoffBase = 30 * time.Second
+	cfg.LoginBackoffMax = 60 * time.Second
+	ts, st := makeServerCfg(t, cfg)
 	tok, _ := st.EnsureBootstrap()
 	if err := st.consumeBootstrap(tok, "alice", "correct"); err != nil {
 		t.Fatal(err)
@@ -331,7 +337,12 @@ func TestLoginThrottle429SymmetricOverExistence(t *testing.T) {
 // TestLoginThrottlePerIPIsolationHTTP: distinct client IPs do not share a counter, and a
 // blocked IP blocks even a fresh username.
 func TestLoginThrottlePerIPIsolationHTTP(t *testing.T) {
-	ts, st := makeServerCfg(t, proxyTrustCfg())
+	// Long backoff base so the IP-A window stays open across the intermediate request's
+	// argon2id work (the 1s default could expire mid-test — the source of the flakiness).
+	cfg := proxyTrustCfg()
+	cfg.LoginBackoffBase = 30 * time.Second
+	cfg.LoginBackoffMax = 60 * time.Second
+	ts, st := makeServerCfg(t, cfg)
 	tok, _ := st.EnsureBootstrap()
 	if err := st.consumeBootstrap(tok, "alice", "correct"); err != nil {
 		t.Fatal(err)
@@ -354,6 +365,103 @@ func TestLoginThrottlePerIPIsolationHTTP(t *testing.T) {
 	rA.Body.Close()
 	if codeA != http.StatusTooManyRequests {
 		t.Fatalf("blocked IP should reject a fresh user: got %d, want 429", codeA)
+	}
+}
+
+// adminToken bootstraps the first admin and returns a live admin API token.
+func adminToken(t *testing.T, st *Storage) string {
+	t.Helper()
+	btok, err := st.EnsureBootstrap()
+	if err != nil || btok == "" {
+		t.Fatalf("ensure bootstrap: %v", err)
+	}
+	if err := st.consumeBootstrap(btok, "admin", "pw"); err != nil {
+		t.Fatalf("consume bootstrap: %v", err)
+	}
+	tok, err := st.login("admin", "pw", time.Hour)
+	if err != nil {
+		t.Fatalf("admin login: %v", err)
+	}
+	return tok
+}
+
+// TestAccountDisableRevokesTokens: disabling an account immediately invalidates its live
+// API token, blocks login, and re-enabling lets it log in afresh while the OLD token stays
+// dead. (Status 404 on the manifest GET = authorized but no manifest; 401 = token rejected.)
+func TestAccountDisableRevokesTokens(t *testing.T) {
+	ts, st := makeServer(t)
+	adminTok := adminToken(t, st)
+	if err := st.createRepo("r1"); err != nil {
+		t.Fatal(err)
+	}
+	bobTok := makeAccount(t, st, "bob", "r1", RoleWriter)
+
+	if code := do(t, ts, "GET", "/repos/r1/manifest", bobTok, ""); code != http.StatusNotFound {
+		t.Fatalf("pre-disable bob (authorized, no manifest): got %d, want 404", code)
+	}
+	if code := do(t, ts, "POST", "/accounts/bob/disable", adminTok, ""); code != http.StatusNoContent {
+		t.Fatalf("disable bob: got %d, want 204", code)
+	}
+	// The old token is now revoked.
+	if code := do(t, ts, "GET", "/repos/r1/manifest", bobTok, ""); code != http.StatusUnauthorized {
+		t.Fatalf("post-disable bob token: got %d, want 401", code)
+	}
+	// A disabled account cannot log in even with the correct password.
+	r := loginReq(t, ts, "bob", "pw")
+	got := r.StatusCode
+	r.Body.Close()
+	if got != http.StatusUnauthorized {
+		t.Fatalf("disabled bob login: got %d, want 401", got)
+	}
+	// Re-enable: bob can log in again; the NEW token works, the OLD one stays revoked.
+	if code := do(t, ts, "POST", "/accounts/bob/enable", adminTok, ""); code != http.StatusNoContent {
+		t.Fatalf("enable bob: got %d, want 204", code)
+	}
+	newTok, err := st.login("bob", "pw", time.Hour)
+	if err != nil {
+		t.Fatalf("bob re-login: %v", err)
+	}
+	if code := do(t, ts, "GET", "/repos/r1/manifest", newTok, ""); code != http.StatusNotFound {
+		t.Fatalf("re-enabled bob new token: got %d, want 404", code)
+	}
+	if code := do(t, ts, "GET", "/repos/r1/manifest", bobTok, ""); code != http.StatusUnauthorized {
+		t.Fatalf("old token after re-enable must stay revoked: got %d, want 401", code)
+	}
+}
+
+// TestDisableAccountAuthorization: disable/enable are admin-only.
+func TestDisableAccountAuthorization(t *testing.T) {
+	ts, st := makeServer(t)
+	_ = adminToken(t, st)
+	if err := st.createRepo("r1"); err != nil {
+		t.Fatal(err)
+	}
+	bobTok := makeAccount(t, st, "bob", "r1", RoleWriter)
+	if code := do(t, ts, "POST", "/accounts/bob/disable", bobTok, ""); code != http.StatusForbidden {
+		t.Fatalf("non-admin disable: got %d, want 403", code)
+	}
+	if code := do(t, ts, "POST", "/accounts/bob/disable", "", ""); code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated disable: got %d, want 401", code)
+	}
+	if code := do(t, ts, "POST", "/accounts/bob/enable", bobTok, ""); code != http.StatusForbidden {
+		t.Fatalf("non-admin enable: got %d, want 403", code)
+	}
+}
+
+// TestDisableUnknownAndLastAdmin: unknown account -> 404; the last enabled admin cannot be
+// disabled (that would lock out all admin operations) -> 409.
+func TestDisableUnknownAndLastAdmin(t *testing.T) {
+	ts, st := makeServer(t)
+	adminTok := adminToken(t, st)
+	if code := do(t, ts, "POST", "/accounts/ghost/disable", adminTok, ""); code != http.StatusNotFound {
+		t.Fatalf("disable unknown: got %d, want 404", code)
+	}
+	if code := do(t, ts, "POST", "/accounts/admin/disable", adminTok, ""); code != http.StatusConflict {
+		t.Fatalf("disable last admin: got %d, want 409", code)
+	}
+	// The guard left the admin enabled, so admin operations still work.
+	if code := do(t, ts, "POST", "/accounts/ghost/enable", adminTok, ""); code != http.StatusNotFound {
+		t.Fatalf("admin still operational after blocked last-admin disable: got %d, want 404", code)
 	}
 }
 

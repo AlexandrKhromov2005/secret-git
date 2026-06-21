@@ -93,7 +93,7 @@ func TestInviteOneTimeExpiryAndBinding(t *testing.T) {
 		t.Fatalf("redeem invite: %v", err)
 	}
 	// Account is bound to repoA with writer role.
-	id, _, _, _, _, err := st.accountByUsername("bob")
+	id, _, _, _, _, _, err := st.accountByUsername("bob")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestInviteBindingIsServerControlled(t *testing.T) {
 	if err := st.consumeInvite(tok, "eve", "pw"); err != nil {
 		t.Fatal(err)
 	}
-	id, _, _, _, _, err := st.accountByUsername("eve")
+	id, _, _, _, _, _, err := st.accountByUsername("eve")
 	if err != nil {
 		t.Fatal(err)
 	}

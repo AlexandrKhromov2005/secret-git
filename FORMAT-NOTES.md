@@ -353,11 +353,18 @@ Two real defects were fixed:
   (`argon2IDKey`) purely so a test can count invocations and prove both branches do the work; production
   never reassigns it.
 
-### Known limitation: no token revocation (v1)
-A leaked/compromised API token is valid until expiry — no deny-list, rotation, or account-disable path that
-invalidates live tokens. Deferred to the account-management increment. Acknowledged availability/abuse gap,
-not a confidentiality break (a token never yields decryption/forgery). Operational mitigation: short
-`TokenTTL`. Recorded in `docs/FORMAT-SPEC-TIER4.md` (ЧАСТЬ D + F).
+### Token revocation: account disable (closed)
+Previously a leaked/compromised API token was valid until expiry (no deny-list). Now an admin can disable an
+account via `POST /accounts/{username}/disable`, which in ONE transaction sets `accounts.disabled=1` AND
+deletes all of the account's `api_tokens` rows — so every live token is revoked immediately and the account
+can neither authenticate nor log in until `POST /accounts/{username}/enable`. `authenticate` rejects a
+disabled account (defense in depth beside the token delete) and `login` rejects it AFTER the argon2id verify,
+so the disabled state is not a timing/enumeration oracle. The last enabled admin cannot be disabled (would
+lock out admin ops) → 409. The `disabled` column is added by an idempotent migration (`addColumnIfMissing`),
+so existing databases migrate forward without data loss.
+Residual limitation (documented): revocation is account-scoped (not per individual token) and admin-driven; a
+leaked token whose account is not disabled still lives to its TTL — keep `TokenTTL` short. A token never
+yields decryption/forgery, so this is an availability/abuse surface, not a confidentiality break.
 
 ### Login rate limiting (/auth/login)
 Closes the unbounded-login DoS (19 MiB argon2id per attempt) + brute-force surface with two layers IN FRONT

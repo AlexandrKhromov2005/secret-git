@@ -76,6 +76,8 @@ func (s *Server) Handler() http.Handler {
 	// Admin (instance-level).
 	mux.HandleFunc("POST /repos", s.handleCreateRepo)
 	mux.HandleFunc("POST /repos/{repo_id}/invites", s.handleCreateInvite)
+	mux.HandleFunc("POST /accounts/{username}/disable", s.handleDisableAccount)
+	mux.HandleFunc("POST /accounts/{username}/enable", s.handleEnableAccount)
 	// Data (repo-scoped roles; bytes are opaque).
 	mux.HandleFunc("GET /repos/{repo_id}/blobs/{hash}", s.handleGetBlob)
 	mux.HandleFunc("HEAD /repos/{repo_id}/blobs/{hash}", s.handleHeadBlob)
@@ -317,7 +319,7 @@ func (s *Server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	// Optionally assign a founder writer at creation time if the account exists.
 	if req.FounderUsername != "" {
-		id, _, _, _, _, err := s.accountByUsername(req.FounderUsername)
+		id, _, _, _, _, _, err := s.accountByUsername(req.FounderUsername)
 		if err != nil {
 			http.Error(w, "founder account not found", http.StatusBadRequest)
 			return
@@ -357,6 +359,38 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{"invite_token": token})
+}
+
+// handleDisableAccount (admin) disables an account and revokes all its live API tokens.
+func (s *Server) handleDisableAccount(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authAdmin(w, r); !ok {
+		return
+	}
+	switch err := s.disableAccount(r.PathValue("username")); {
+	case errors.Is(err, errNotFound):
+		http.Error(w, "unknown account", http.StatusNotFound)
+	case errors.Is(err, errLastAdmin):
+		http.Error(w, "cannot disable the last admin", http.StatusConflict)
+	case err != nil:
+		http.Error(w, "server error", http.StatusInternalServerError)
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// handleEnableAccount (admin) clears the disabled flag; the user must log in again.
+func (s *Server) handleEnableAccount(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authAdmin(w, r); !ok {
+		return
+	}
+	switch err := s.enableAccount(r.PathValue("username")); {
+	case errors.Is(err, errNotFound):
+		http.Error(w, "unknown account", http.StatusNotFound)
+	case err != nil:
+		http.Error(w, "server error", http.StatusInternalServerError)
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 // --- blob endpoints ---

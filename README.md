@@ -37,8 +37,13 @@ repository. Be precise about what that does and does not buy you.
   token — can upload junk packs, delete blobs, or otherwise disrupt the team. This is within the model (the
   server is not a security boundary), but it is a real operational risk for a team. Storage quotas and
   garbage collection are **not implemented yet** (a known limitation).
-- **No token revocation.** A leaked API token stays valid until it expires; there is no account-disable or
-  deny-list. Mitigate with a short token TTL. Account management / revocation is deferred.
+- **Token revocation is account-scoped and admin-driven.** An admin can disable an account
+  (`POST /accounts/{username}/disable`), which **immediately revokes all of that account's live API tokens**
+  and blocks new logins until `POST /accounts/{username}/enable`. This closes the earlier "no revocation" gap.
+  The residual limitation: revocation acts per account, not per individual token, and requires an admin — so a
+  leaked token whose account is *not* disabled still lives until its TTL. Keep `TokenTTL` short as defense in
+  depth. (A token never yields decryption or forgery regardless; this is an availability/abuse surface, not a
+  confidentiality break.)
 - **An irreducible floor — a fully frozen, never-syncing participant.** A server that owns storage can
   always withhold updates and show a victim a *self-consistent but stale* snapshot (old roster + keyfile +
   manifest, mutually consistent by generation and `roster_hash`). The m1/m2 bindings do **not** prevent

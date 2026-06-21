@@ -29,6 +29,7 @@ var (
 	errBadHash       = errors.New("server: blob hash mismatch") // -> 400
 	errUsedOrExpired = errors.New("server: token used or expired")
 	errBadToken      = errors.New("server: bad token")
+	errLastAdmin     = errors.New("server: cannot disable the last admin") // -> 409
 )
 
 // Storage bundles the SQLite metadata DB and the on-disk blob directory. Manifest
@@ -70,7 +71,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   argon2_salt   TEXT NOT NULL,
   argon2_params TEXT NOT NULL,
   argon2_hash   TEXT NOT NULL,
-  is_admin      INTEGER NOT NULL DEFAULT 0
+  is_admin      INTEGER NOT NULL DEFAULT 0,
+  disabled      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS repos (
   repo_id    TEXT PRIMARY KEY,
@@ -118,6 +120,38 @@ CREATE TABLE IF NOT EXISTS login_throttle (
 );`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("server: migrate: %w", err)
+	}
+	// Forward-migrate a DB created before account disabling existed: CREATE TABLE IF NOT
+	// EXISTS never adds a column to a pre-existing table, so add it explicitly (idempotent).
+	if err := s.addColumnIfMissing("accounts", "disabled", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// addColumnIfMissing adds column (with the given SQL declaration) to table only when it
+// is not already present, so existing databases migrate forward without data loss. table
+// is a trusted compile-time constant (never user input).
+func (s *Storage) addColumnIfMissing(table, column, decl string) error {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info('` + table + `')`)
+	if err != nil {
+		return fmt.Errorf("server: inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == column {
+			return rows.Err() // already present
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl)); err != nil {
+		return fmt.Errorf("server: add column %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -204,22 +238,22 @@ func (s *Storage) consumeBootstrap(token, username, password string) error {
 
 // --- accounts / login ---
 
-func (s *Storage) accountByUsername(username string) (id int64, salt, params, hash string, isAdmin bool, err error) {
-	var adm int
-	row := s.db.QueryRow(`SELECT id, argon2_salt, argon2_params, argon2_hash, is_admin FROM accounts WHERE username=?`, username)
-	if err = row.Scan(&id, &salt, &params, &hash, &adm); err != nil {
+func (s *Storage) accountByUsername(username string) (id int64, salt, params, hash string, isAdmin, disabled bool, err error) {
+	var adm, dis int
+	row := s.db.QueryRow(`SELECT id, argon2_salt, argon2_params, argon2_hash, is_admin, disabled FROM accounts WHERE username=?`, username)
+	if err = row.Scan(&id, &salt, &params, &hash, &adm, &dis); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = errNotFound
 		}
 		return
 	}
-	return id, salt, params, hash, adm == 1, nil
+	return id, salt, params, hash, adm == 1, dis == 1, nil
 }
 
 // login verifies the password and issues an API token (returns the plaintext token
 // once; stores only its hash). SECURITY-REVIEW: API token CSPRNG, hash-only, expiry.
 func (s *Storage) login(username, password string, ttl time.Duration) (string, error) {
-	id, salt, params, hash, _, err := s.accountByUsername(username)
+	id, salt, params, hash, _, disabled, err := s.accountByUsername(username)
 	if err != nil {
 		if errors.Is(err, errNotFound) {
 			// SECURITY-REVIEW: anti-enumeration — run an equivalent-cost argon2id pass for
@@ -235,7 +269,11 @@ func (s *Storage) login(username, password string, ttl time.Duration) (string, e
 	if err != nil {
 		return "", err
 	}
-	if !ok {
+	// SECURITY-REVIEW: a disabled account is rejected like a wrong password — the SAME
+	// generic errBadToken (-> 401), AFTER the argon2id verify — so the disabled state is not
+	// a timing/enumeration oracle. A disabled account also has no live tokens (disable
+	// deletes them), so it cannot authenticate or mint a new one until re-enabled.
+	if !ok || disabled {
 		return "", errBadToken
 	}
 	token, err := newToken()
@@ -259,10 +297,10 @@ func (s *Storage) authenticate(token string) (account, error) {
 		stored string
 		exp    int64
 	)
-	row := s.db.QueryRow(`SELECT t.token_hash, t.account_id, t.expiry, a.is_admin
+	row := s.db.QueryRow(`SELECT t.token_hash, t.account_id, t.expiry, a.is_admin, a.disabled
 		FROM api_tokens t JOIN accounts a ON a.id=t.account_id WHERE t.token_hash=?`, th)
-	var adm int
-	if err := row.Scan(&stored, &acc.id, &exp, &adm); err != nil {
+	var adm, dis int
+	if err := row.Scan(&stored, &acc.id, &exp, &adm, &dis); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return account{}, errBadToken
 		}
@@ -271,11 +309,76 @@ func (s *Storage) authenticate(token string) (account, error) {
 	if !constantTimeEqualHex(stored, th) {
 		return account{}, errBadToken
 	}
+	// SECURITY-REVIEW: a disabled account's tokens are invalid even before expiry — this is
+	// the revocation check. disableAccount also deletes the rows, so this is defense in depth
+	// against any token created in a race with the disable.
+	if dis == 1 {
+		return account{}, errBadToken
+	}
 	if time.Now().Unix() >= exp {
 		return account{}, errUsedOrExpired
 	}
 	acc.isAdmin = adm == 1
 	return acc, nil
+}
+
+// disableAccount disables an account AND deletes all of its API tokens, so every live
+// token is revoked immediately and the account can neither authenticate nor log in until
+// re-enabled. It refuses to disable the last enabled admin (which would lock out all admin
+// operations). Unknown username -> errNotFound; disabling an already-disabled account is a
+// no-op (and skips the last-admin guard, which only fires on an enabled admin).
+// SECURITY-REVIEW: revocation = disabled flag + delete api_tokens, in one transaction.
+func (s *Storage) disableAccount(username string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var (
+		id            int64
+		isAdmin, disV int
+	)
+	err = tx.QueryRow(`SELECT id, is_admin, disabled FROM accounts WHERE username=?`, username).Scan(&id, &isAdmin, &disV)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if isAdmin == 1 && disV == 0 {
+		var otherAdmins int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM accounts WHERE is_admin=1 AND disabled=0 AND id<>?`, id).Scan(&otherAdmins); err != nil {
+			return err
+		}
+		if otherAdmins == 0 {
+			return errLastAdmin
+		}
+	}
+	if _, err := tx.Exec(`UPDATE accounts SET disabled=1 WHERE id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM api_tokens WHERE account_id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// enableAccount clears the disabled flag. The user must log in again for a fresh token
+// (disable deleted the old ones). Unknown username -> errNotFound.
+func (s *Storage) enableAccount(username string) error {
+	res, err := s.db.Exec(`UPDATE accounts SET disabled=0 WHERE username=?`, username)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errNotFound
+	}
+	return nil
 }
 
 // --- repos / access / invites ---

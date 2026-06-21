@@ -149,13 +149,10 @@ export GOFLAGS='-buildvcs=false'
 go test -buildvcs=false -count=1 -v ./...
 ```
 
-### Но:
-У тебя сейчас есть **2 flaky теста**, которые иногда падают:
-
-- `TestLoginThrottle429WithoutArgon2`
-- `TestLoginThrottlePerIPIsolationHTTP`
-
-То есть полный suite может быть красным не из-за Docker, а из-за этих тестов.
+Полный suite сейчас **стабильно зелёный** — два бывших flaky-теста
+(`TestLoginThrottle429WithoutArgon2`, `TestLoginThrottlePerIPIsolationHTTP`) починены: они
+строились с дефолтным 1-секундным окном backoff и иногда пересекали границу wall-clock
+секунды; теперь используют длинный backoff base, как и `TestLoginThrottle429SymmetricOverExistence`.
 
 ---
 
@@ -240,12 +237,8 @@ DOCKER_BUILDKIT=1 sudo docker build \
 ```
 
 ### Важно
-Сейчас этот target может падать, потому что в полном suite у тебя есть 2 flaky теста.
-
-То есть:
-
-- **для CI сейчас лучше использовать `devtest` + ручной запуск non-flaky набора**
-- либо потом добавить отдельный target, например `ci-test-nonflaky`
+Раньше этот target мог падать из-за 2 flaky-тестов; они починены, так что `ci-test` теперь
+прогоняет полный suite зелёным.
 
 ---
 
@@ -386,11 +379,7 @@ sudo docker run -d --name encgit-server -p 127.0.0.1:8080:8080 -v encgit-data:/d
 
 # 13. Что у тебя сейчас по состоянию тестов
 
-Стабильно/основательно проходят все тесты, **кроме двух flaky**:
-
-- `TestLoginThrottle429WithoutArgon2`
-- `TestLoginThrottlePerIPIsolationHTTP`
-
-То есть проблема сейчас уже не в Docker, а в нестабильных тестах `internal/server`.
+Весь suite проходит стабильно (бывшие flaky throttle-тесты починены). `go test ./...` и
+target `ci-test` должны быть зелёными.
 
 ---
