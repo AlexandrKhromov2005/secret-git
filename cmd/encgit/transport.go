@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -21,6 +23,38 @@ import (
 	"encgit/internal/store/localfs"
 )
 
+// caCertEnv lets a user set the server's pinned CA once instead of repeating --cacert.
+const caCertEnv = "ENCGIT_CACERT"
+
+// resolveCACert returns the explicit --cacert value, falling back to ENCGIT_CACERT.
+func resolveCACert(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return os.Getenv(caCertEnv)
+}
+
+// httpClientForCACert builds an *http.Client that trusts ONLY the PEM certificate(s)
+// in caCertPath — i.e. it PINS a self-signed / private-CA server cert as the sole trust
+// anchor (stronger than the system pool, and the right model for a bare-IP deployment).
+// An empty path returns a nil client so callers fall back to default system trust.
+func httpClientForCACert(caCertPath string) (*http.Client, error) {
+	if caCertPath == "" {
+		return nil, nil
+	}
+	pemBytes, err := os.ReadFile(caCertPath)
+	if err != nil {
+		return nil, fmt.Errorf("read --cacert %s: %w", caCertPath, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("--cacert %s: no PEM certificates found", caCertPath)
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	return &http.Client{Transport: tr}, nil
+}
+
 // isHTTPURL reports whether s parses with an http/https scheme. This is the ONLY rule
 // for selecting the HTTP store; any other value is a localfs directory path. No
 // heuristics beyond the scheme (confirmed convention).
@@ -31,8 +65,10 @@ func isHTTPURL(s string) bool {
 
 func tokenKey(rawURL string) string { return strings.TrimRight(rawURL, "/") }
 
-// openStore selects the store implementation from the --store value's scheme.
-func openStore(storeFlag, repoID, seedPath string) (store.Store, error) {
+// openStore selects the store implementation from the --store value's scheme. For an
+// http(s) store, caCertPath (if set) pins the server's CA so a self-signed cert is
+// trusted; empty -> default system trust.
+func openStore(storeFlag, repoID, seedPath, caCertPath string) (store.Store, error) {
 	if isHTTPURL(storeFlag) {
 		token, err := loadToken(seedPath, storeFlag)
 		if err != nil {
@@ -42,7 +78,11 @@ func openStore(storeFlag, repoID, seedPath string) (store.Store, error) {
 			return nil, fmt.Errorf("no API token for %s; run `encgit login --seed %s %s <username>` first",
 				tokenKey(storeFlag), seedPath, tokenKey(storeFlag))
 		}
-		return httpstore.New(storeFlag, repoID, token, nil)
+		client, err := httpClientForCACert(resolveCACert(caCertPath))
+		if err != nil {
+			return nil, err
+		}
+		return httpstore.New(storeFlag, repoID, token, client)
 	}
 	return localfs.Open(storeFlag)
 }
@@ -89,10 +129,19 @@ func saveToken(seedPath, rawURL, token string) error {
 	return os.WriteFile(tokenStorePath(seedPath), data, 0o600)
 }
 
-// serverLogin exchanges username+password for an API token (returned once).
-func serverLogin(baseURL, username, password string) (string, error) {
+// serverLogin exchanges username+password for an API token (returned once). A nil client
+// uses default system trust; pass a pinned-CA client for a self-signed server.
+func serverLogin(client *http.Client, baseURL, username, password string) (string, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
-	resp, err := http.Post(tokenKey(baseURL)+"/auth/login", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", tokenKey(baseURL)+"/auth/login", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -139,6 +188,7 @@ func cmdPublishGenesis(args []string) error {
 	repoID := fs.String("repo-id", "", "repo_id (hex) from init")
 	from := fs.String("from", "", "local init store directory holding the genesis (keyfile + roster)")
 	seedPath := fs.String("seed", "", "member seed file (locates the API token for --store)")
+	caCert := fs.String("cacert", "", "PEM file pinning the server's TLS cert (or set "+caCertEnv+")")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -152,7 +202,7 @@ func cmdPublishGenesis(args []string) error {
 	if err != nil {
 		return err
 	}
-	remote, err := openStore(*storeFlag, *repoID, *seedPath)
+	remote, err := openStore(*storeFlag, *repoID, *seedPath, *caCert)
 	if err != nil {
 		return err
 	}
@@ -223,22 +273,27 @@ func publishGenesis(local, remote store.Store) error {
 func cmdLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	seedPath := fs.String("seed", "", "path to the member seed file (the API token is stored next to it)")
+	caCert := fs.String("cacert", "", "PEM file pinning the server's TLS cert (or set "+caCertEnv+")")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	rest := fs.Args()
 	if len(rest) != 2 || *seedPath == "" {
-		return errors.New("usage: encgit login --seed FILE <url> <username>")
+		return errors.New("usage: encgit login [--cacert FILE] --seed FILE <url> <username>")
 	}
 	serverURL, username := rest[0], rest[1]
 	if !isHTTPURL(serverURL) {
 		return fmt.Errorf("url must be http(s)://...")
 	}
+	client, err := httpClientForCACert(resolveCACert(*caCert))
+	if err != nil {
+		return err
+	}
 	pw, err := readPassword()
 	if err != nil {
 		return fmt.Errorf("read password: %w", err)
 	}
-	token, err := serverLogin(serverURL, username, pw)
+	token, err := serverLogin(client, serverURL, username, pw)
 	if err != nil {
 		return err
 	}

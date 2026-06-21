@@ -156,7 +156,7 @@ func TestFullCLIFlowFromScratch(t *testing.T) {
 
 	// 4. Founder: login (saves the API token next to the seed, like `encgit login`), then
 	//    publish-genesis VIA THE COMMAND, then push the actual git repo.
-	tok, err := serverLogin(ts.URL, "founder", "pw")
+	tok, err := serverLogin(nil, ts.URL, "founder", "pw")
 	if err != nil || tok == "" {
 		t.Fatalf("founder login: %v", err)
 	}

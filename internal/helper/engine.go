@@ -473,11 +473,21 @@ func (e *Engine) Fetch() error {
 		return err
 	}
 	if st.Version != 0 {
-		if m.Version <= st.Version {
-			return fmt.Errorf("helper: rollback detected: manifest version %d <= pinned %d", m.Version, st.Version)
-		}
-		if m.PrevManifestHash == nil || *m.PrevManifestHash != st.ManifestHash {
-			return fmt.Errorf("helper: equivocation detected: prev_manifest_hash does not chain to pinned manifest")
+		switch {
+		case m.Version < st.Version:
+			return fmt.Errorf("helper: rollback detected: manifest version %d < pinned %d", m.Version, st.Version)
+		case m.Version == st.Version:
+			// Same version: accept ONLY if it is byte-identical to what we pinned, in
+			// which case we are already up to date and there is nothing to import (a
+			// clean no-op). A DIFFERENT manifest at the same version is equivocation.
+			if newHash != st.ManifestHash {
+				return fmt.Errorf("helper: equivocation detected: manifest version %d diverges from pinned manifest", m.Version)
+			}
+			return nil
+		default: // m.Version > st.Version
+			if m.PrevManifestHash == nil || *m.PrevManifestHash != st.ManifestHash {
+				return fmt.Errorf("helper: equivocation detected: prev_manifest_hash does not chain to pinned manifest")
+			}
 		}
 	}
 

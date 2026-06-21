@@ -84,6 +84,11 @@ run 'encgit login --seed FILE URL USERNAME' first to obtain an API token (stored
 to the seed). member-add takes the new member's public keys and OOB-verified
 fingerprint (from 'encgit identity show', confirmed out of band).
 
+--cacert FILE pins the server's TLS certificate (PEM) as the sole trust anchor — use it
+for a self-signed / private-CA server (e.g. a bare-IP deployment). It can be set once via
+the ENCGIT_CACERT environment variable instead of repeating the flag. Without it the
+system certificate pool is used.
+
 To bring up a server-backed repo from scratch: 'encgit init' locally, give the printed
 repo_id + fingerprint to an admin out of band, have the admin create the repo with that
 repo_id and grant you writer, then 'encgit login', 'encgit publish-genesis --store URL
@@ -273,7 +278,7 @@ func cmdInit(args []string) error {
 
 // engineFlags is the shared flag set for push/fetch.
 type engineFlags struct {
-	storeDir, seedPath, repoID, gitDir, statePath string
+	storeDir, seedPath, repoID, gitDir, statePath, caCert string
 }
 
 func bindEngineFlags(fs *flag.FlagSet) *engineFlags {
@@ -283,6 +288,7 @@ func bindEngineFlags(fs *flag.FlagSet) *engineFlags {
 	fs.StringVar(&f.repoID, "repo-id", "", "repo_id (hex) from init")
 	fs.StringVar(&f.gitDir, "git", ".", "path to the local git repository")
 	fs.StringVar(&f.statePath, "state", "", "path to the local pin/state file (default <git>/.encgit/state.json)")
+	fs.StringVar(&f.caCert, "cacert", "", "PEM file pinning the server's TLS cert for an http(s) --store (or set "+caCertEnv+")")
 	return f
 }
 
@@ -294,7 +300,7 @@ func (f *engineFlags) open() (*helper.Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := openStore(f.storeDir, f.repoID, f.seedPath)
+	st, err := openStore(f.storeDir, f.repoID, f.seedPath, f.caCert)
 	if err != nil {
 		return nil, err
 	}

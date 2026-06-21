@@ -227,6 +227,39 @@ func TestPushFetchEndToEnd(t *testing.T) {
 	}
 }
 
+// TestFetchUpToDateNoOp verifies that re-fetching when the server is at the SAME
+// version the client already pinned (nothing new) is a clean no-op, not a spurious
+// "rollback detected" error.
+func TestFetchUpToDateNoOp(t *testing.T) {
+	isolateGit(t)
+	root := t.TempDir()
+	st := openStore(t, filepath.Join(root, "store"))
+	member := newMember(t)
+	repoID, err := helper.Init(st, member, "founder")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := filepath.Join(root, "src")
+	initRepo(t, src, "main")
+	commit(t, src, "a.txt", "v1", "c1")
+	srcEng := engine(t, src, st, member, repoID)
+	if err := srcEng.Push(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(root, "dst")
+	initRepo(t, dst, "main")
+	dstEng := engine(t, dst, st, member, repoID)
+	if err := dstEng.Fetch(); err != nil { // pin v1
+		t.Fatalf("first fetch: %v", err)
+	}
+	// Re-fetch with nothing new on the server: must be a no-op, not a rollback error.
+	if err := dstEng.Fetch(); err != nil {
+		t.Fatalf("re-fetch of identical version should be a no-op, got: %v", err)
+	}
+}
+
 // conflictOnce wraps a store and, on the first CASManifest call, runs a competing
 // push and then returns a version conflict — forcing the engine into a real rebase.
 type conflictOnce struct {
