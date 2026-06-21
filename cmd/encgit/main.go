@@ -84,6 +84,7 @@ usage:
   encgit login          --seed FILE URL USERNAME
   encgit publish-genesis --store URL --repo-id HEX --from DIR --seed FILE
   encgit config show    [--git DIR]
+  encgit config get     [--git DIR] (store|repo_id|seed|cacert)
   encgit config set     (--global | --git DIR) [--store URL] [--seed FILE] [--repo-id HEX] [--cacert FILE]
 
 Defaults for --store/--seed/--repo-id/--cacert can be saved so commands need no flags:

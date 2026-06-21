@@ -1,10 +1,49 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// TestConfigGet checks `encgit config get KEY` prints the single resolved value and errors
+// on an unknown key.
+func TestConfigGet(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	repoDir := filepath.Join(root, "repo")
+	if err := saveConfig(repoConfigPath(repoDir), repoConfig{Store: "https://s", RepoID: "abc", Seed: "/s", CACert: "/c"}); err != nil {
+		t.Fatal(err)
+	}
+	get := func(key string) string {
+		t.Helper()
+		r, w, _ := os.Pipe()
+		old := os.Stdout
+		os.Stdout = w
+		err := cmdConfig([]string{"get", "--git", repoDir, key})
+		_ = w.Close()
+		os.Stdout = old
+		if err != nil {
+			t.Fatalf("config get %s: %v", key, err)
+		}
+		b, _ := io.ReadAll(r)
+		return strings.TrimSpace(string(b))
+	}
+	if v := get("store"); v != "https://s" {
+		t.Errorf("store: got %q", v)
+	}
+	if v := get("repo_id"); v != "abc" {
+		t.Errorf("repo_id: got %q", v)
+	}
+	if v := get("cacert"); v != "/c" {
+		t.Errorf("cacert: got %q", v)
+	}
+	if err := cmdConfig([]string{"get", "--git", repoDir, "bogus"}); err == nil {
+		t.Error("unknown key should error")
+	}
+}
 
 // TestConfigMergePrecedence checks that loadConfig overlays the per-repo config on top of
 // the user-global one (per-repo wins; missing fields inherit from global), that a missing

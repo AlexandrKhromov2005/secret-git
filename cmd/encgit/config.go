@@ -138,6 +138,27 @@ func cmdConfig(args []string) error {
 		out, _ := json.MarshalIndent(cfg, "", "  ")
 		fmt.Println(string(out))
 		return nil
+	case "get":
+		// `encgit config get [--git DIR] KEY` prints one resolved value (for scripting).
+		cfg, err := loadConfig(*gitDir)
+		if err != nil {
+			return err
+		}
+		switch key := fs.Arg(0); key {
+		case "store":
+			fmt.Println(cfg.Store)
+		case "repo_id", "repo-id":
+			fmt.Println(cfg.RepoID)
+		case "seed":
+			fmt.Println(cfg.Seed)
+		case "cacert":
+			fmt.Println(cfg.CACert)
+		case "":
+			return errors.New("config get: KEY required (store|repo_id|seed|cacert)")
+		default:
+			return fmt.Errorf("config get: unknown key %q (want store|repo_id|seed|cacert)", key)
+		}
+		return nil
 	case "set":
 		var path string
 		switch {
@@ -163,6 +184,6 @@ func cmdConfig(args []string) error {
 		fmt.Printf("wrote %s\n", path)
 		return nil
 	default:
-		return fmt.Errorf("config: unknown subcommand %q (want show|set)", sub)
+		return fmt.Errorf("config: unknown subcommand %q (want show|get|set)", sub)
 	}
 }
