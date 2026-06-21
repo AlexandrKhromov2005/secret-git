@@ -40,6 +40,8 @@ func main() {
 		err = cmdPush(os.Args[2:])
 	case "fetch":
 		err = cmdFetch(os.Args[2:])
+	case "clone":
+		err = cmdClone(os.Args[2:])
 	case "login":
 		err = cmdLogin(os.Args[2:])
 	case "publish-genesis":
@@ -73,6 +75,7 @@ usage:
   encgit init           --store DIR --seed FILE
   encgit push           --store DIR --seed FILE --repo-id HEX [--git DIR] [--state FILE] [refs...]
   encgit fetch          --store DIR --seed FILE --repo-id HEX [--git DIR] [--state FILE]
+  encgit clone          --store URL --seed FILE --repo-id HEX [--cacert FILE] [--branch NAME] DIR
   encgit member-add     --store DIR --seed FILE --repo-id HEX --name NAME --x25519 HEX --ed25519 HEX --fingerprint HEX [--git DIR]
   encgit member-remove  --store DIR --seed FILE --repo-id HEX --fingerprint HEX [--git DIR]
   encgit rekey          --store DIR --seed FILE --repo-id HEX [--git DIR]

@@ -193,3 +193,56 @@ func TestFullCLIFlowFromScratch(t *testing.T) {
 		t.Fatalf("publish-genesis (rerun) should be a no-op: %v", err)
 	}
 }
+
+// TestCloneCommand verifies `encgit clone` does git init + fetch + checkout in one step,
+// materializing the working tree. Uses a localfs store (no HTTP needed): init -> push ->
+// clone into a fresh dir, then assert the ref and decrypted content.
+func TestCloneCommand(t *testing.T) {
+	isolateGit(t)
+	root := t.TempDir()
+	storeDir := filepath.Join(root, "store")
+
+	seedPath := filepath.Join(root, "seed")
+	founder := writeSeed(t, seedPath)
+	st, err := localfs.Open(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoID, err := helper.Init(st, founder, "founder")
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	src := filepath.Join(root, "src")
+	initRepo(t, src, "main")
+	sha := commit(t, src, "a.txt", "clone me", "first")
+	if err := cmdPush([]string{"--store", storeDir, "--seed", seedPath, "--repo-id", repoID, "--git", src}); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	dst := filepath.Join(root, "dst") // must NOT pre-exist; clone creates+inits it
+	if err := cmdClone([]string{"--store", storeDir, "--seed", seedPath, "--repo-id", repoID, dst}); err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	if got := git(t, dst, "rev-parse", "refs/heads/main"); got != sha {
+		t.Fatalf("clone ref mismatch: got %s want %s", got, sha)
+	}
+	// checkout populated the working tree (not just the refs/objects).
+	if got, err := os.ReadFile(filepath.Join(dst, "a.txt")); err != nil || string(got) != "clone me" {
+		t.Fatalf("clone working tree: got %q err %v", got, err)
+	}
+
+	// Refuses to clone over a non-empty directory.
+	if err := cmdClone([]string{"--store", storeDir, "--seed", seedPath, "--repo-id", repoID, dst}); err == nil {
+		t.Fatal("clone into a non-empty dir should fail")
+	}
+
+	// A failed clone removes the directory it created, so the same path can be retried.
+	bad := filepath.Join(root, "bad")
+	if err := cmdClone([]string{"--store", storeDir, "--seed", seedPath, "--repo-id", "00000000000000000000000000000000", bad}); err == nil {
+		t.Fatal("clone of a wrong repo_id should fail")
+	}
+	if dirExists(bad) {
+		t.Fatalf("a failed clone must remove the dir it created; %s still exists", bad)
+	}
+}
