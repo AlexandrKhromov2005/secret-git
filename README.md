@@ -92,6 +92,10 @@ honest about the tool's maturity — it is stated deliberately, not buried.
 
 ## Deployment requirements (HARD)
 
+> For the full step-by-step deploy (build the image, run behind Caddy/TLS, bootstrap, harden,
+> update) see **[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)** and the templates in
+> [`deploy/`](deploy/). The requirements below are non-negotiable for any deployment.
+
 - **TLS is mandatory.** `encgit-server` speaks plain HTTP and deliberately does **not** terminate TLS. You
   **MUST** run it behind a TLS-terminating reverse proxy: bearer tokens and passwords **MUST NEVER** travel
   in plaintext. (Client encryption protects repository *content* regardless, but the API auth layer is only
@@ -233,6 +237,9 @@ ciphertext.
 
 ## Documentation
 
+- `docs/DEPLOYMENT.md` — **deploying the server** (build the image, run behind Caddy/TLS, bootstrap, update).
+- `docs/Docker.md` — Dockerfile build targets (`devtest`/`ci-test`/`prod`) and developer/test workflows.
+- `deploy/` — committed deployment templates (`docker-compose.yml`, `Caddyfile`).
 - `docs/FORMAT-SPEC.md` — frozen on-disk/on-wire format (v1/v2).
 - `docs/FORMAT-SPEC-TIER3.md` — roster / membership.
 - `docs/FORMAT-SPEC-TIER4.md` — HTTP server, authorization, rate limiting, and the provisioning flow (§I).

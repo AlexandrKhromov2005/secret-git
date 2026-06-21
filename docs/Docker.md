@@ -1,3 +1,6 @@
+> Это справочник по **Dockerfile-таргетам** (`devtest`/`ci-test`/`prod`) и dev/test-воркфлоу.
+> За полным деплоем сервера (Caddy/TLS, compose, bootstrap, обновление) — см.
+> [`DEPLOYMENT.md`](DEPLOYMENT.md) и шаблоны в [`../deploy/`](../deploy/).
 
 ---
 

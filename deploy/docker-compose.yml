@@ -1,0 +1,54 @@
+# Production compose for encgit-server behind a Caddy TLS proxy.
+# See docs/DEPLOYMENT.md for the full walkthrough.
+#
+# Expected layout on the deploy host (e.g. /opt/encgit/):
+#   docker-compose.yml   (this file)
+#   Caddyfile            (TLS + reverse proxy; see deploy/Caddyfile)
+#   certs/               (server.crt + server.key for a bare-IP / self-signed deployment)
+#   src/                 (the encgit source tree — `git archive` or `git clone`)
+# Data (SQLite db + blobs) is persisted in the host path /var/lib/encgit.
+services:
+  encgit-server:
+    build:
+      context: ./src
+      dockerfile: Docker/Dockerfile
+      target: prod
+    image: encgit-server:prod
+    command:
+      - "--addr=0.0.0.0:8080"
+      - "--db=/data/encgit.db"
+      - "--blobs=/data/blobs"
+      # Trust the client-IP header only from the Caddy container's network (the edge
+      # subnet below), and read the real client IP from X-Forwarded-For.
+      - "-trusted-proxy-cidrs=172.28.0.0/16"
+      - "-client-ip-header=X-Forwarded-For"
+    volumes:
+      - /var/lib/encgit:/data # chown to 65532:65532 (the distroless nonroot uid) before first run
+    networks: [edge]
+    restart: unless-stopped
+    # NOTE: 8080 is intentionally NOT published — it is reachable only by Caddy on the
+    # internal network, never directly from the host/internet.
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on: [encgit-server]
+    ports:
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/etc/caddy/certs:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [edge]
+    restart: unless-stopped
+
+networks:
+  edge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  caddy-data:
+  caddy-config:

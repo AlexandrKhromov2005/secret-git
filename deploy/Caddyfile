@@ -1,0 +1,23 @@
+# Caddy config for encgit-server. Caddy terminates TLS and reverse-proxies to the
+# encgit-server container. See docs/DEPLOYMENT.md.
+
+# --- Bare-IP deployment (self-signed cert) ---
+# Clients connecting by IP send no SNI, so a `:443` catch-all serves the cert for every
+# handshake. Generate certs/server.{crt,key} with an IP SAN (see DEPLOYMENT.md) and have
+# clients pin it (encgit --cacert / ENCGIT_CACERT, verified by fingerprint out of band).
+{
+	auto_https off
+}
+
+:443 {
+	tls /etc/caddy/certs/server.crt /etc/caddy/certs/server.key
+	reverse_proxy encgit-server:8080
+}
+
+# --- Domain deployment (automatic HTTPS) — use this INSTEAD of the block above ---
+# If you have a domain pointed at the host, let Caddy obtain a Let's Encrypt cert
+# automatically (no certs/ volume needed, and clients use normal system trust):
+#
+# encgit.example.com {
+# 	reverse_proxy encgit-server:8080
+# }
