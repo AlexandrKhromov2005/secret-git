@@ -128,6 +128,23 @@ an existing genesis); `push` then publishes the encrypted manifest + packs. Othe
 `encgit member-add` (cryptographic membership) and given API accounts via Tier-4 invites — two orthogonal
 mechanisms.
 
+### Onboarding another machine
+
+Once a repo exists, a member sets up a new machine for an *existing* identity with one command — it builds the
+client, pins the server cert (verified against an out-of-band fingerprint), writes the config, logs in, and
+optionally clones:
+
+```
+scripts/onboard.sh --server https://HOST --fingerprint <sha256 from a trusted channel> \
+  --seed /path/to/your.seed --user USERNAME [--repo-id HEX --dir DIR]
+```
+
+Transfer your existing seed to the machine first (it is your identity / master secret); the script never
+creates or moves it. Get the fingerprint with
+`openssl x509 -in server.crt -noout -fingerprint -sha256` on a machine you trust. After onboarding,
+`encgit push` / `encgit fetch` run with no flags (defaults come from `~/.config/encgit/config.json` and the
+per-repo `<git>/.encgit/config.json` that `encgit clone` writes; see `encgit config`).
+
 ## Documentation
 
 - `docs/FORMAT-SPEC.md` — frozen on-disk/on-wire format (v1/v2).
