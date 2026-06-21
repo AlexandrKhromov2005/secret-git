@@ -10,5 +10,8 @@ CLAUDE.local.md
 *.test
 *.out
 
+# Docker offline image bundles — generated locally, never commit (huge binary)
+Docker/*.tar
+
 # Local scratch
 /tmp/
