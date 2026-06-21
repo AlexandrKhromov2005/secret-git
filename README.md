@@ -145,6 +145,22 @@ creates or moves it. Get the fingerprint with
 `encgit push` / `encgit fetch` run with no flags (defaults come from `~/.config/encgit/config.json` and the
 per-repo `<git>/.encgit/config.json` that `encgit clone` writes; see `encgit config`).
 
+### Updating the server
+
+Roll the server to a new revision in place:
+
+```
+scripts/server-update.sh --host root@HOST [--server-url https://HOST --cacert FILE]
+```
+
+It runs `go test` as a gate, backs up the DB and tags the running image as `encgit-server:prev`,
+syncs the source, rebuilds (the old container keeps serving during the build), recreates the
+container, and health-checks (the account count must be unchanged and a login probe must return
+401). It prints rollback steps (restore the DB backup + retag the previous image). Updates are
+safe because the format is frozen, the API is additive, schema changes use idempotent migrations,
+and data lives in the `/var/lib/encgit` host volume that survives container recreation — so
+existing clients and data keep working. Most client-only changes need no server update at all.
+
 ## Documentation
 
 - `docs/FORMAT-SPEC.md` — frozen on-disk/on-wire format (v1/v2).
