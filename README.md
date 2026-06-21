@@ -11,6 +11,31 @@ even with root, holds no keys and never sees your code, file names, or history.
 Read the **[Security model](#security-model)** below — what is and is not protected, in precise terms —
 before trusting encgit with anything that matters.
 
+### Architecture at a glance
+
+Everything that protects your data happens on the **client**. The only thing that ever crosses the network
+is ciphertext; the server (even compromised, even with root) holds no keys and cannot read or forge it.
+
+```mermaid
+flowchart LR
+    subgraph client["Client — the single trust boundary"]
+        direction TB
+        id["seed → identity<br/>X25519 + Ed25519"]
+        key["repo key"]
+        ops["encrypt packs/manifest (age)<br/>sign manifest (Ed25519)<br/>verify on every fetch"]
+        id --> ops
+        key --> ops
+    end
+    subgraph edge["TLS proxy (Caddy)"]
+        tls["terminates TLS<br/>bearer-token auth"]
+    end
+    subgraph server["Untrusted server — adversary with root"]
+        store["stores ONLY ciphertext<br/>+ auth / CAS metadata<br/>no keys, ever"]
+    end
+    ops -->|ciphertext only| tls
+    tls --> store
+```
+
 ## Security model
 
 encgit is built so an untrusted server — including its operator with root — cannot read or forge your
@@ -160,6 +185,51 @@ container, and health-checks (the account count must be unchanged and a login pr
 safe because the format is frozen, the API is additive, schema changes use idempotent migrations,
 and data lives in the `/var/lib/encgit` host volume that survives container recreation — so
 existing clients and data keep working. Most client-only changes need no server update at all.
+
+## How it works (in pictures)
+
+**What the server can and cannot see.** It needs some metadata to route and order requests, but never the
+content or any key:
+
+```mermaid
+flowchart TB
+    srv["Untrusted server"]
+    srv --> sees["SEES — metadata only:<br/>blob sizes &amp; count · push timing/frequency<br/>which account pushed · repo_id · version counters"]
+    srv --> blind["CANNOT read or forge:<br/>your code · file &amp; directory names<br/>commit messages · history graph · any key"]
+```
+
+**Push (write path) — encrypt + sign before anything leaves the client:**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant G as git
+    participant C as encgit
+    participant S as server
+    G->>C: objects (rev-list / pack-objects)
+    Note over C: encrypt pack with the repo key (age)<br/>build manifest, sign it (Ed25519)<br/>encrypt the manifest
+    C->>S: PUT pack — ciphertext
+    C->>S: CAS manifest (If-Match version)
+    Note over S: stores opaque bytes only
+```
+
+**Fetch (read path) — verify everything, then decrypt:**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as server
+    participant C as encgit
+    participant G as git
+    S->>C: manifest · roster · keyfile · packs (all ciphertext)
+    Note over C: 1 verify manifest signature — signer must be in the roster<br/>2 roster_hash binds manifest to roster (m1)<br/>3 keyfile generation matches roster (m2)<br/>4 version greater than pin, prev-hash chains (anti-rollback)
+    Note over C: decrypt ONLY after every check passes
+    C->>G: index-pack + update-ref
+```
+
+A tampered, forged, spliced, or rolled-back state fails one of those checks and is rejected with an error —
+never silently accepted. A reader who is not in the roster cannot obtain the repo key, so they get only
+ciphertext.
 
 ## Documentation
 
