@@ -200,6 +200,7 @@ func TestFullCLIFlowFromScratch(t *testing.T) {
 func TestCloneCommand(t *testing.T) {
 	isolateGit(t)
 	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg")) // hermetic global config
 	storeDir := filepath.Join(root, "store")
 
 	seedPath := filepath.Join(root, "seed")
@@ -231,6 +232,13 @@ func TestCloneCommand(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(dst, "a.txt")); err != nil || string(got) != "clone me" {
 		t.Fatalf("clone working tree: got %q err %v", got, err)
 	}
+	// clone wrote a repo-local config, so a FLAG-FREE fetch in that dir works.
+	if _, err := os.Stat(filepath.Join(dst, ".encgit", "config.json")); err != nil {
+		t.Fatalf("clone should write a repo-local config: %v", err)
+	}
+	if err := cmdFetch([]string{"--git", dst}); err != nil {
+		t.Fatalf("flag-free fetch (config-driven) should work: %v", err)
+	}
 
 	// Refuses to clone over a non-empty directory.
 	if err := cmdClone([]string{"--store", storeDir, "--seed", seedPath, "--repo-id", repoID, dst}); err == nil {
@@ -244,5 +252,23 @@ func TestCloneCommand(t *testing.T) {
 	}
 	if dirExists(bad) {
 		t.Fatalf("a failed clone must remove the dir it created; %s still exists", bad)
+	}
+
+	// Regression: clone must use the RESOLVED repo_id (config), not the raw flag. With
+	// store+seed+repo_id all in the global config, a flagless clone must derive the right
+	// keys and succeed (this path would fail if clone passed the empty *repoID to the engine).
+	gp, err := globalConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(gp, repoConfig{Store: storeDir, Seed: seedPath, RepoID: repoID}); err != nil {
+		t.Fatal(err)
+	}
+	dst2 := filepath.Join(root, "dst2")
+	if err := cmdClone([]string{dst2}); err != nil {
+		t.Fatalf("clone with repo_id from global config (no flags): %v", err)
+	}
+	if got := git(t, dst2, "rev-parse", "refs/heads/main"); got != sha {
+		t.Fatalf("global-config clone ref mismatch: got %s want %s", got, sha)
 	}
 }

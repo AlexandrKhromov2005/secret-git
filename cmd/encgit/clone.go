@@ -31,18 +31,27 @@ func cmdClone(args []string) error {
 		return err
 	}
 	dir := fs.Arg(0)
-	if dir == "" || *store == "" || *seedPath == "" || *repoID == "" {
-		return errors.New("usage: encgit clone --store URL --seed FILE --repo-id HEX [--cacert FILE] [--branch NAME] DIR")
+	// Fill missing values from the user-global config (no repo dir exists yet to read from).
+	g, err := loadConfig("")
+	if err != nil {
+		return err
+	}
+	storeV := firstNonEmpty(*store, g.Store)
+	seedV := firstNonEmpty(*seedPath, g.Seed)
+	repoIDV := firstNonEmpty(*repoID, g.RepoID)
+	caCertV := firstNonEmpty(*caCert, g.CACert)
+	if dir == "" || storeV == "" || seedV == "" || repoIDV == "" {
+		return errors.New("usage: encgit clone --store URL --seed FILE --repo-id HEX [--cacert FILE] [--branch NAME] DIR (or set defaults via `encgit config set --global`)")
 	}
 	if nonEmptyDir(dir) {
 		return fmt.Errorf("clone: %s already exists and is not empty", dir)
 	}
 
-	id, err := loadSeed(*seedPath)
+	id, err := loadSeed(seedV)
 	if err != nil {
 		return err
 	}
-	st, err := openStore(*store, *repoID, *seedPath, *caCert)
+	st, err := openStore(storeV, repoIDV, seedV, caCertV)
 	if err != nil {
 		return err
 	}
@@ -65,7 +74,7 @@ func cmdClone(args []string) error {
 	if sp == "" {
 		sp = filepath.Join(dir, ".encgit", "state.json")
 	}
-	eng, err := helper.Open(dir, st, localstate.NewStore(sp), id, *repoID)
+	eng, err := helper.Open(dir, st, localstate.NewStore(sp), id, repoIDV)
 	if err != nil {
 		return cleanup(err)
 	}
@@ -78,6 +87,10 @@ func cmdClone(args []string) error {
 	}
 	if out, err := exec.Command("git", "-C", dir, "checkout", "-f", b).CombinedOutput(); err != nil {
 		return cleanup(fmt.Errorf("git checkout %s: %v: %s", b, err, strings.TrimSpace(string(out))))
+	}
+	// Record the repo-local config so a later bare `encgit push`/`fetch` in this dir works.
+	if err := saveConfig(repoConfigPath(dir), repoConfig{Store: storeV, RepoID: repoIDV, Seed: seedV, CACert: caCertV}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: clone succeeded but could not write %s: %v\n", repoConfigPath(dir), err)
 	}
 	fmt.Printf("cloned into %s (branch %s)\n", dir, b)
 	return nil

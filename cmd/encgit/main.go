@@ -42,6 +42,8 @@ func main() {
 		err = cmdFetch(os.Args[2:])
 	case "clone":
 		err = cmdClone(os.Args[2:])
+	case "config":
+		err = cmdConfig(os.Args[2:])
 	case "login":
 		err = cmdLogin(os.Args[2:])
 	case "publish-genesis":
@@ -81,6 +83,15 @@ usage:
   encgit rekey          --store DIR --seed FILE --repo-id HEX [--git DIR]
   encgit login          --seed FILE URL USERNAME
   encgit publish-genesis --store URL --repo-id HEX --from DIR --seed FILE
+  encgit config show    [--git DIR]
+  encgit config set     (--global | --git DIR) [--store URL] [--seed FILE] [--repo-id HEX] [--cacert FILE]
+
+Defaults for --store/--seed/--repo-id/--cacert can be saved so commands need no flags:
+'encgit config set --global --store URL --seed FILE --cacert FILE' (user-wide) and, per
+repo, '--git DIR --repo-id HEX'. 'encgit clone' writes the repo-local config for you, so
+afterwards a bare 'encgit push' / 'encgit fetch' in that dir just works. Precedence:
+explicit flag > repo config (<git>/.encgit/config.json) > global config
+(~/.config/encgit/config.json) > ENCGIT_CACERT.
 
 --store accepts a localfs directory OR an http(s):// server URL (Tier 4). For a URL,
 run 'encgit login --seed FILE URL USERNAME' first to obtain an API token (stored next
@@ -296,14 +307,24 @@ func bindEngineFlags(fs *flag.FlagSet) *engineFlags {
 }
 
 func (f *engineFlags) open() (*helper.Engine, error) {
-	if f.storeDir == "" || f.seedPath == "" || f.repoID == "" {
-		return nil, errors.New("--store, --seed and --repo-id are required")
-	}
-	id, err := loadSeed(f.seedPath)
+	// Resolve each value with precedence: explicit flag > repo/global config (loaded from
+	// the --git dir) > built-in. This lets day-to-day commands be a bare `encgit push`.
+	cfg, err := loadConfig(f.gitDir)
 	if err != nil {
 		return nil, err
 	}
-	st, err := openStore(f.storeDir, f.repoID, f.seedPath, f.caCert)
+	store := firstNonEmpty(f.storeDir, cfg.Store)
+	seed := firstNonEmpty(f.seedPath, cfg.Seed)
+	repoID := firstNonEmpty(f.repoID, cfg.RepoID)
+	caCert := firstNonEmpty(f.caCert, cfg.CACert)
+	if store == "" || seed == "" || repoID == "" {
+		return nil, errors.New("missing store/seed/repo-id: pass --store/--seed/--repo-id or set them with `encgit config set`")
+	}
+	id, err := loadSeed(seed)
+	if err != nil {
+		return nil, err
+	}
+	st, err := openStore(store, repoID, seed, caCert)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +333,7 @@ func (f *engineFlags) open() (*helper.Engine, error) {
 		statePath = filepath.Join(f.gitDir, ".encgit", "state.json")
 	}
 	state := localstate.NewStore(statePath)
-	return helper.Open(f.gitDir, st, state, id, f.repoID)
+	return helper.Open(f.gitDir, st, state, id, repoID)
 }
 
 func cmdPush(args []string) error {
